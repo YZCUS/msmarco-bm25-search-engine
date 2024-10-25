@@ -75,7 +75,7 @@ private:
         std::cout << "Block index loaded. Current block index: " << current_block_index_ << std::endl;
     }
 
-    void openBlock()
+    bool openBlock()
     {
         std::cout << "Opening block." << std::endl;
         block_doc_id_reader = block_info_[current_block_index_].second.first;
@@ -87,6 +87,7 @@ private:
         bytes_size_ -= block_size;
         current_block_.resize(block_size);
         index_file_.read(reinterpret_cast<char *>(current_block_.data()), block_size); // read the block into memory
+        return bytes_size_ + block_size >= 0;
     }
 
     bool loadNextBlock()
@@ -99,8 +100,7 @@ private:
             return false;
         }
 
-        openBlock();
-        return true;
+        return openBlock();
     }
 
 public:
@@ -109,11 +109,12 @@ public:
     {
         std::cout << "Inverted list initialized. Start pos: " << start_pos_ << ", Size: " << bytes_size_ << " bytes." << std::endl;
         block_doc_id_reader = -1;
+        current_block_index_ = -1;
     }
 
     bool next(int &doc_id, int &freq)
     {
-        if (block_freq_reader >= block_info_[current_block_index_].second.first + block_doc_id_size + block_freq_size)
+        if (current_block_index_ == -1 || block_freq_reader >= block_info_[current_block_index_].second.first + block_doc_id_size + block_freq_size)
         {
             if (!loadNextBlock())
             {
@@ -130,6 +131,9 @@ public:
 
         // check if the doc_id reader is out of range
         size_t relative_pos = block_doc_id_reader - block_info_[current_block_index_].second.first;
+        std::cout << "Relative pos: " << relative_pos << std::endl;
+        std::cout << "Current block size: " << current_block_.size() << std::endl;
+
         if (relative_pos >= current_block_.size())
         {
             std::cerr << "Relative pos is out of range" << std::endl;
@@ -143,7 +147,7 @@ public:
             // Calculate the relative position of block_doc_id_reader within the current block
             const uint8_t *doc_id_ptr = current_block_.data() + relative_pos;
 
-            if (relative_pos + 5 > current_block_.size())
+            if (relative_pos >= block_doc_id_size + block_freq_size)
             {
                 std::cerr << "Relative pos is out of range" << std::endl;
                 return loadNextBlock();
@@ -178,7 +182,7 @@ public:
         block_doc_id_reader += bytes_read;                                                                                          // Update the reader position by bytes_read
         std::cout << "Doc ID diff: " << doc_id_diff << std::endl;
 
-        if (block_freq_reader + bytes_read > block_info_[current_block_index_].second.first + block_doc_id_size + block_freq_size)
+        if (block_freq_reader + bytes_read >= block_info_[current_block_index_].second.first + block_doc_id_size + block_freq_size)
         {
             std::cerr << "Block freq reader is out of range" << std::endl;
             return loadNextBlock();
