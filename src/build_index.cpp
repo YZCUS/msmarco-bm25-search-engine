@@ -269,7 +269,8 @@ void processTarGz(const std::string &filename, int chunk_size)
                         leftover = line;
                         break;
                     }
-
+                    // std::cout << "line: " << line << std::endl;
+                    // std::cin.get();
                     size_t memory_increment = processLine(line, document_info, index, lexicon, term_id_to_word, last_doc_id, term_id, line_position);
                     line_position += line.size() + 1; // +1 for '\n'
                     current_memory_usage += memory_increment;
@@ -455,7 +456,7 @@ void externalSort(int num_files,
     int last_doc_id = 0;
 
     const int POSTING_PER_BLOCK = 128;
-    std::vector<std::pair<int, int64_t>> block_info; // store last_doc_id and block size(bytes)
+    std::vector<std::pair<int, std::pair<int64_t, int64_t>>> block_info; // store last_doc_id, doc_id_size(bytes), and freq_size(bytes)
     std::vector<uint8_t> merged_doc_ids;
     std::vector<uint8_t> merged_counts;
     int postings_in_block = 0; // track number of postings in the current block
@@ -495,7 +496,7 @@ void externalSort(int num_files,
             merged_counts.insert(merged_counts.end(), encoded_count.begin(), encoded_count.end());
 
             // update current position
-            current_position += encoded_diff.size() + encoded_count.size();
+            current_position += encoded_diff.size();
             last_doc_id += diff;
             postings_in_block++; // increment postings count
 
@@ -505,9 +506,11 @@ void externalSort(int num_files,
                 // add buffer to final_index_file
                 final_index_file.write(reinterpret_cast<const char *>(merged_doc_ids.data()), merged_doc_ids.size()); // writing 128 doc_ids
                 final_index_file.write(reinterpret_cast<const char *>(merged_counts.data()), merged_counts.size());   // writing 128 counts
-                int current_block_size = merged_doc_ids.size() + merged_counts.size();
+
+                std::pair<int64_t, int64_t> current_block_size = {merged_doc_ids.size(), merged_counts.size()};
                 block_info.emplace_back(last_doc_id, current_block_size); // store the last doc_id and the block size
-                final_block_info2 << last_doc_id << " " << current_block_size << "\n";
+                final_block_info2 << last_doc_id << " " << current_block_size.first << " " << current_block_size.second << "\n";
+                current_position += merged_counts.size();
 
                 // clear buffer and reset postings count
                 merged_doc_ids.clear();
@@ -531,13 +534,13 @@ void externalSort(int num_files,
     {
         final_index_file.write(reinterpret_cast<const char *>(merged_doc_ids.data()), merged_doc_ids.size());
         final_index_file.write(reinterpret_cast<const char *>(merged_counts.data()), merged_counts.size());
-        int current_block_size = merged_doc_ids.size() + merged_counts.size();
+        std::pair<int64_t, int64_t> current_block_size = {merged_doc_ids.size(), merged_counts.size()};
         block_info.emplace_back(last_doc_id, current_block_size);
-        final_block_info2 << last_doc_id << " " << current_block_size << "\n";
+        final_block_info2 << last_doc_id << " " << current_block_size.first << " " << current_block_size.second << "\n";
     }
 
     // write the last block info into the file
-    final_block_info.write(reinterpret_cast<const char *>(block_info.data()), block_info.size() * sizeof(std::pair<int, int64_t>));
+    final_block_info.write(reinterpret_cast<const char *>(block_info.data()), block_info.size() * sizeof(std::pair<int, std::pair<int64_t, int64_t>>));
 
     final_index_file.close();
     final_lexicon_file.close();

@@ -23,7 +23,8 @@ const double b = 0.75;
 
 // decode function
 uint32_t varbyteDecode(const std::vector<uint8_t> &bytes);
-int varbyteDecode(const uint8_t *data, size_t max_size, size_t &bytes_read);
+int varbyteDecode(const uint8_t *data, size_t &bytes_read);
+
 size_t varbyteEncodedSize(int value);
 
 struct LexiconEntry
@@ -46,21 +47,32 @@ private:
     std::ifstream &index_file_;
     int64_t start_pos_;
     int64_t bytes_size_;
-    size_t current_pos_;
-    std::vector<std::pair<int, int>> &block_info_;
+    int64_t block_doc_id_reader;
+    int64_t block_doc_id_size;
+    int64_t block_freq_reader;
+    int64_t block_freq_size;
+    std::vector<std::pair<int, std::pair<int64_t, std::pair<int64_t, int64_t>>>> &block_info_;
     std::vector<uint8_t> current_block_;
     int current_block_index_;
 
     void loadBlockIndex()
     {
         std::cout << "Loading block index." << std::endl;
-        for (int i = 0; i < block_info_.size(); ++i)
+        if (current_block_index_ == -1)
         {
-            if (start_pos_ < block_info_[i].second)
+
+            for (int i = 0; i < block_info_.size(); ++i)
             {
-                current_block_index_ = i - 1;
-                break;
+                if (start_pos_ < block_info_[i].second.first)
+                {
+                    current_block_index_ = i - 1;
+                    break;
+                }
             }
+        }
+        else
+        {
+            current_block_index_++;
         }
         std::cout << "Block index loaded. Current block index: " << current_block_index_ << std::endl;
     }
@@ -68,64 +80,104 @@ private:
     void openBlock()
     {
         std::cout << "Opening block." << std::endl;
-        index_file_.seekg(block_info_[current_block_index_].second);
-        if (current_block_index_ == block_info_.size() - 1) // last block
-        {
-            bytes_size_ = bytes_size_ - block_info_[current_block_index_].second;
-        }
-        else // not the last block
-        {
-            bytes_size_ = block_info_[current_block_index_ + 1].second - block_info_[current_block_index_].second;
-        }
-        current_block_.resize(bytes_size_);
-        index_file_.read(reinterpret_cast<char *>(current_block_.data()), bytes_size_); // read the block into memory
-        current_pos_ = 0;                                                               // reset the current position
+        block_doc_id_reader = block_info_[current_block_index_].second.first;
+        block_doc_id_size = block_info_[current_block_index_].second.second.first;
+        block_freq_reader = block_info_[current_block_index_].second.first + block_doc_id_size;
+        block_freq_size = block_info_[current_block_index_].second.second.second;
+        index_file_.seekg(block_doc_id_reader);
+        int64_t block_size = block_doc_id_size + block_freq_size;
+        bytes_size_ -= block_size;
+        current_block_.resize(block_size);
+        index_file_.read(reinterpret_cast<char *>(current_block_.data()), block_size); // read the block into memory
     }
 
     bool loadNextBlock()
     {
         std::cout << "Loading next block." << std::endl;
-        current_block_index_++;
+        loadBlockIndex();
+
         if (current_block_index_ == block_info_.size()) // no more blocks
         {
             return false;
         }
+
         openBlock();
         return true;
     }
 
 public:
-    InvertedList(std::ifstream &index_file, int64_t start_pos, int64_t bytes_size, std::vector<std::pair<int, int>> &block_info)
+    InvertedList(std::ifstream &index_file, int64_t start_pos, int64_t bytes_size, std::vector<std::pair<int, std::pair<int64_t, std::pair<int64_t, int64_t>>>> &block_info)
         : index_file_(index_file), start_pos_(start_pos), bytes_size_(bytes_size), block_info_(block_info)
     {
         std::cout << "Inverted list initialized. Start pos: " << start_pos_ << ", Size: " << bytes_size_ << " bytes." << std::endl;
-        loadBlockIndex();
-        openBlock();
+        block_doc_id_reader = -1;
     }
 
     bool next(int &doc_id, int &freq)
     {
-        if (current_pos_ >= POSTING_PER_BLOCK) // Check if we have processed all postings in the current block
+        if (block_freq_reader >= block_doc_id_reader + block_doc_id_size + block_freq_size)
         {
             if (!loadNextBlock())
             {
+                std::cout << "No more blocks." << std::endl;
                 return false;
             }
-            current_pos_ = 0; // Reset position after loading a new block
+            std::cout << "Next block loaded." << std::endl;
         }
 
         size_t bytes_read = 0;
+        std::cout << "Start to find next" << std::endl;
+        // Count the number of doc_ids we need to skip, moving both doc_id and freq readers
+        std::cout << "Block doc id reader: " << block_doc_id_reader << std::endl;
+        std::cout << "Start pos: " << start_pos_ << std::endl;
+        while (block_doc_id_reader < start_pos_)
+        {
+            bytes_read = 0;
 
-        // Decode the next doc_id diff
-        int doc_id_diff = varbyteDecode(current_block_.data() + current_pos_, current_block_.size() - current_pos_, bytes_read);
-        current_pos_ += bytes_read; // Move position by the size of the encoded doc_id
+            // Calculate the relative position of block_doc_id_reader within the current block
+            const uint8_t *doc_id_ptr = current_block_.data() + (block_doc_id_reader - block_info_[current_block_index_].second.first);
+
+            // Iterate over bytes until we find the byte with MSB set to 1 (indicating the last byte of the current doc_id)
+            while (!(doc_id_ptr[bytes_read] & 0x80)) // MSB is 0, meaning this is not the last byte
+            {
+                bytes_read++; // Move to the next byte
+            }
+            bytes_read++; // Move past the last byte of this varbyte encoded doc_id
+
+            block_doc_id_reader += bytes_read; // Update doc_id_reader by the number of bytes read
+
+            // Now, move the frequency reader by the corresponding number of bytes
+            bytes_read = 0;
+
+            // Calculate the relative position of block_freq_reader within the current block
+            const uint8_t *freq_ptr = current_block_.data() + (block_freq_reader - block_info_[current_block_index_].second.first);
+
+            // Same as above, read until we find the last byte of the current frequency
+            while (!(freq_ptr[bytes_read] & 0x80)) // MSB is 0, not the last byte
+            {
+                bytes_read++; // Move to the next byte
+            }
+            bytes_read++; // Move past the last byte of this varbyte encoded frequency
+
+            block_freq_reader += bytes_read; // Update freq_reader by the number of bytes read
+        }
+
+        // Decode the next doc_id difference
+        const uint8_t *doc_id_ptr = current_block_.data() + (block_doc_id_reader - block_info_[current_block_index_].second.first); // Pointer within the current block
+        int doc_id_diff = varbyteDecode(doc_id_ptr, bytes_read);                                                                    // Decode using the block-relative pointer
+        block_doc_id_reader += bytes_read;                                                                                          // Update the reader position by bytes_read
+        std::cout << "Doc ID diff: " << doc_id_diff << std::endl;
 
         // Decode the corresponding frequency
-        int freq_pos = POSTING_PER_BLOCK + current_pos_; // Calculate position for frequency
-        freq = varbyteDecode(current_block_.data() + freq_pos, current_block_.size() - freq_pos, bytes_read);
+        bytes_read = 0;                                                                                                         // Reset bytes_read for frequency decoding
+        const uint8_t *freq_ptr = current_block_.data() + (block_freq_reader - block_info_[current_block_index_].second.first); // Pointer within the current block
+        freq = varbyteDecode(freq_ptr, bytes_read);                                                                             // Decode using the block-relative pointer
+        block_freq_reader += bytes_read;                                                                                        // Update the reader position by bytes_read
+        std::cout << "Frequency: " << freq << std::endl;
 
         // Update the doc_id with the decoded difference
         doc_id += doc_id_diff;
+        std::cout << "doc_id: " << doc_id << std::endl;
 
         return true;
     }
@@ -137,7 +189,7 @@ class SearchEngine
 {
 private: // private members
     std::unordered_map<std::string, LexiconEntry> lexicon;
-    std::vector<std::pair<int, int>> block;
+    std::vector<std::pair<int, std::pair<int64_t, std::pair<int64_t, int64_t>>>> block;
     std::unordered_map<int, std::string> term_id_to_word;
     std::ifstream index_file;
     std::ifstream doc_info_file;
@@ -177,12 +229,14 @@ public: // public members
         std::cout << "Loading block info..." << std::endl;
         std::ifstream block_info(block_info_file);
         int last_doc_id = 0;
-        int block_start_pos = 0;
-        int block_size = 0;
-        while (block_info >> last_doc_id >> block_size) // tested
+        int64_t block_start_pos = 0;
+        int64_t block_doc_id_size = 0;
+        int64_t block_freq_size = 0;
+        while (block_info >> last_doc_id >> block_doc_id_size >> block_freq_size) // tested
         {
-            block.push_back({last_doc_id, block_start_pos});
-            block_start_pos += block_size;
+            // std::cout << "Block info: " << last_doc_id << " " << block_doc_id_size << " " << block_freq_size << std::endl;
+            block.push_back({last_doc_id, {block_start_pos, {block_doc_id_size, block_freq_size}}});
+            block_start_pos += block_doc_id_size + block_freq_size;
         }
         std::cout << "Block info loaded." << std::endl;
     }
@@ -204,19 +258,6 @@ public: // public members
         }
         avg_doc_length = static_cast<double>(total_length) / total_docs;
         std::cout << "Doc info loaded." << std::endl;
-    }
-
-    std::string getOriginalFileContent(int doc_id)
-    {
-        return "document content";
-        // Seek to the position in the compressed file
-        original_file.seekg(lines_pos[doc_id]);
-
-        // Read the compressed data
-        std::string line;
-        std::getline(original_file, line);
-
-        return line;
     }
 
     std::vector<SearchResult> search(const std::string &query, bool conjunctive)
@@ -263,6 +304,12 @@ public: // public members
                   { return a.score > b.score; });
         if (results.size() > 10)
             results.resize(10);
+        std::vector<int> result_doc_ids;
+        for (const auto &result : results)
+        {
+            result_doc_ids.push_back(result.doc_id);
+        }
+
         return results;
     }
 
@@ -274,8 +321,27 @@ private: // private methods
         std::string term;
         while (iss >> term)
         {
-            std::transform(term.begin(), term.end(), term.begin(), ::tolower);
-            terms.push_back(term);
+            std::string current_word;
+            for (auto &c : term)
+            {
+                if (std::isalpha(c))
+                {
+                    current_word += std::tolower(c);
+                }
+                else if (std::isdigit(c))
+                {
+                    current_word += c;
+                }
+                else if (!current_word.empty())
+                {
+                    terms.push_back(current_word);
+                    current_word.clear();
+                }
+            }
+            if (!current_word.empty())
+            {
+                terms.push_back(current_word);
+            }
         }
         std::cout << "Query terms: ";
         for (const auto &term : terms)
@@ -303,43 +369,42 @@ private: // private methods
         int current_doc = 0;
         std::vector<int> doc_ids(lists.size(), 0);
         std::vector<int> freqs(lists.size(), 0);
-        std::cout << "Conjunctive search initialized." << std::endl;
 
         while (true)
         {
-            bool all_equal = true;
-            int max_doc = -1;             // Start with an invalid doc_id value
-            bool any_list_active = false; // To track if any list is still active
+            bool all_same_value = true;
+            int max_doc_id = -1;                   // Start with an invalid doc_id value
+            bool at_least_one_list_active = false; // To track if any list is still active
 
             // Process each inverted list
             for (size_t i = 0; i < lists.size(); ++i)
             {
                 // Advance the list until we find a doc_id >= current_doc
                 while (doc_ids[i] < current_doc && lists[i].next(doc_ids[i], freqs[i]))
-                {
-                }
+                    ; // update doc_ids until it >= current_doc
+
                 std::cout << "Doc ID: " << doc_ids[i] << ", Freq: " << freqs[i] << std::endl;
 
                 if (doc_ids[i] != current_doc)
-                    all_equal = false;
+                    all_same_value = false;
 
                 // Only consider active lists (i.e., where next() was successful)
                 if (lists[i].next(doc_ids[i], freqs[i]))
                 {
-                    any_list_active = true;
+                    at_least_one_list_active = true;
 
                     // Find the maximum doc_id across all lists
-                    if (doc_ids[i] > max_doc)
-                        max_doc = doc_ids[i];
+                    if (doc_ids[i] > max_doc_id)
+                        max_doc_id = doc_ids[i];
                 }
             }
 
             // If no list is active anymore, stop the search
-            if (!any_list_active)
+            if (!at_least_one_list_active)
                 break;
 
             // If all lists have the same doc_id, calculate the score and move to the next document
-            if (all_equal)
+            if (all_same_value)
             {
                 if (current_doc < doc_lengths.size()) // Ensure doc_lengths[current_doc] is valid
                 {
@@ -358,11 +423,11 @@ private: // private methods
             else
             {
                 // Move to the largest doc_id found across the lists to continue
-                current_doc = max_doc;
+                current_doc = max_doc_id;
             }
 
             // Exit condition: stop when the current doc_id exceeds total_docs
-            if (current_doc >= total_docs || max_doc == -1)
+            if (current_doc >= total_docs || max_doc_id == -1)
                 break;
         }
 
@@ -446,26 +511,28 @@ size_t varbyteEncodedSize(int value)
     return size;
 }
 
-int varbyteDecode(const uint8_t *data, size_t max_size, size_t &bytes_read)
+int varbyteDecode(const uint8_t *data, size_t &bytes_read)
 {
-    int value = 0;
-    int shift = 0;
-    bytes_read = 0;
+    int result = 0;
+    bytes_read = 0; // Reset the byte count for this decoding
+    int shift = 0;  // Shift to combine 7-bit parts of each byte
 
-    for (size_t i = 0; i < max_size; ++i)
+    while (true)
     {
-        uint8_t byte = data[i];
-        value |= (byte & 0x7F) << shift; // Use lower 7 bits
-        shift += 7;
-        bytes_read++;
+        uint8_t byte = data[bytes_read];
+        result |= (byte & 0x7F) << shift; // Extract the lower 7 bits and shift into place
+        shift += 7;                       // Prepare to add the next 7 bits
 
-        if (byte & 0x80) // Check if this is the last byte
+        bytes_read++; // Move to the next byte
+
+        // If the MSB is 1, it's the last byte of this number, break out of the loop
+        if (byte & 0x80)
         {
             break;
         }
     }
 
-    return value;
+    return result;
 }
 
 int main()
@@ -496,8 +563,8 @@ int main()
         {
             std::cout << "Doc ID: " << result.doc_id << ", Score: " << result.score << std::endl;
             // find line position of the original file and print the content
-            std::string content = engine.getOriginalFileContent(result.doc_id);
-            std::cout << content << std::endl;
+            // std::string content = engine.getOriginalFileContent(result.doc_id);
+            // std::cout << content << std::endl;
         }
     }
 
