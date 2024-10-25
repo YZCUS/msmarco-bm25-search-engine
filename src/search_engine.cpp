@@ -25,8 +25,6 @@ const double b = 0.75;
 uint32_t varbyteDecode(const std::vector<uint8_t> &bytes);
 int varbyteDecode(const uint8_t *data, size_t &bytes_read);
 
-size_t varbyteEncodedSize(int value);
-
 struct LexiconEntry
 {
     int term_id;
@@ -82,7 +80,7 @@ private:
         std::cout << "Opening block." << std::endl;
         block_doc_id_reader = block_info_[current_block_index_].second.first;
         block_doc_id_size = block_info_[current_block_index_].second.second.first;
-        block_freq_reader = block_info_[current_block_index_].second.first + block_doc_id_size;
+        block_freq_reader = block_doc_id_reader + block_doc_id_size;
         block_freq_size = block_info_[current_block_index_].second.second.second;
         index_file_.seekg(block_doc_id_reader);
         int64_t block_size = block_doc_id_size + block_freq_size;
@@ -115,14 +113,13 @@ public:
 
     bool next(int &doc_id, int &freq)
     {
-        if (block_freq_reader >= block_doc_id_reader + block_doc_id_size + block_freq_size)
+        if (block_freq_reader >= block_info_[current_block_index_].second.first + block_doc_id_size + block_freq_size)
         {
             if (!loadNextBlock())
             {
                 std::cout << "No more blocks." << std::endl;
                 return false;
             }
-            std::cout << "Next block loaded." << std::endl;
         }
 
         size_t bytes_read = 0;
@@ -130,43 +127,62 @@ public:
         // Count the number of doc_ids we need to skip, moving both doc_id and freq readers
         std::cout << "Block doc id reader: " << block_doc_id_reader << std::endl;
         std::cout << "Start pos: " << start_pos_ << std::endl;
-        while (block_doc_id_reader < start_pos_)
+
+        // check if the doc_id reader is out of range
+        size_t relative_pos = block_doc_id_reader - block_info_[current_block_index_].second.first;
+        if (relative_pos >= current_block_.size())
+        {
+            std::cerr << "Relative pos is out of range" << std::endl;
+            return loadNextBlock();
+        }
+
+        while (block_doc_id_reader < start_pos_ && block_doc_id_reader < block_doc_id_size + block_freq_size + block_info_[current_block_index_].second.first)
         {
             bytes_read = 0;
 
             // Calculate the relative position of block_doc_id_reader within the current block
-            const uint8_t *doc_id_ptr = current_block_.data() + (block_doc_id_reader - block_info_[current_block_index_].second.first);
+            const uint8_t *doc_id_ptr = current_block_.data() + relative_pos;
 
-            // Iterate over bytes until we find the byte with MSB set to 1 (indicating the last byte of the current doc_id)
-            while (!(doc_id_ptr[bytes_read] & 0x80)) // MSB is 0, meaning this is not the last byte
+            if (relative_pos + 5 > current_block_.size())
             {
-                bytes_read++; // Move to the next byte
+                std::cerr << "Relative pos is out of range" << std::endl;
+                return loadNextBlock();
             }
-            bytes_read++; // Move past the last byte of this varbyte encoded doc_id
 
-            block_doc_id_reader += bytes_read; // Update doc_id_reader by the number of bytes read
+            while ((doc_id_ptr[bytes_read] & 0x80)) // MSB is 1, meaning this is not the last byte
+            {
+                bytes_read++;
+            }
+            bytes_read++;
 
-            // Now, move the frequency reader by the corresponding number of bytes
+            block_doc_id_reader += bytes_read;
+
+            // move the frequency reader by the corresponding number of bytes
             bytes_read = 0;
 
-            // Calculate the relative position of block_freq_reader within the current block
             const uint8_t *freq_ptr = current_block_.data() + (block_freq_reader - block_info_[current_block_index_].second.first);
 
-            // Same as above, read until we find the last byte of the current frequency
-            while (!(freq_ptr[bytes_read] & 0x80)) // MSB is 0, not the last byte
+            // read until we find the last byte of the current frequency
+            while ((freq_ptr[bytes_read] & 0x80)) // MSB is 1, meaning this is not the last byte
             {
-                bytes_read++; // Move to the next byte
+                bytes_read++;
             }
-            bytes_read++; // Move past the last byte of this varbyte encoded frequency
+            bytes_read++;
 
-            block_freq_reader += bytes_read; // Update freq_reader by the number of bytes read
+            block_freq_reader += bytes_read;
         }
 
         // Decode the next doc_id difference
         const uint8_t *doc_id_ptr = current_block_.data() + (block_doc_id_reader - block_info_[current_block_index_].second.first); // Pointer within the current block
-        int doc_id_diff = varbyteDecode(doc_id_ptr, bytes_read);                                                                    // Decode using the block-relative pointer
+        int32_t doc_id_diff = varbyteDecode(doc_id_ptr, bytes_read);                                                                // Decode using the block-relative pointer
         block_doc_id_reader += bytes_read;                                                                                          // Update the reader position by bytes_read
         std::cout << "Doc ID diff: " << doc_id_diff << std::endl;
+
+        if (block_freq_reader + bytes_read > block_info_[current_block_index_].second.first + block_doc_id_size + block_freq_size)
+        {
+            std::cerr << "Block freq reader is out of range" << std::endl;
+            return loadNextBlock();
+        }
 
         // Decode the corresponding frequency
         bytes_read = 0;                                                                                                         // Reset bytes_read for frequency decoding
@@ -181,8 +197,6 @@ public:
 
         return true;
     }
-
-    int64_t getSize() const { return bytes_size_; }
 };
 
 class SearchEngine
@@ -352,7 +366,7 @@ private: // private methods
         return terms;
     }
 
-    double computeIDF(int64_t term_freq)
+    double computeIDF(int term_freq)
     {
         return std::log((total_docs - term_freq + 0.5) / (term_freq + 0.5) + 1.0);
     }
@@ -388,7 +402,7 @@ private: // private methods
                 if (doc_ids[i] != current_doc)
                     all_same_value = false;
 
-                // Only consider active lists (i.e., where next() was successful)
+                // Only consider active lists
                 if (lists[i].next(doc_ids[i], freqs[i]))
                 {
                     at_least_one_list_active = true;
@@ -408,12 +422,15 @@ private: // private methods
             {
                 if (current_doc < doc_lengths.size()) // Ensure doc_lengths[current_doc] is valid
                 {
+                    std::cout << "All lists have the same doc_id: " << current_doc << std::endl;
                     double score = 0;
                     int doc_length = doc_lengths[current_doc];
                     for (size_t i = 0; i < lists.size(); ++i)
                     {
-                        double idf = computeIDF(lists[i].getSize());
+                        double idf = computeIDF(lexicon[term_id_to_word[i]].postings_num);
                         double tf = computeTF(freqs[i], doc_length);
+                        std::cout << "IDF: " << idf << ", TF: " << tf << std::endl;
+
                         score += idf * tf;
                     }
                     results.push_back({current_doc, score});
@@ -452,37 +469,38 @@ private: // private methods
 
         while (!pq.empty())
         {
-            int doc_id = -pq.top().first;
+            int cur_doc_id = -pq.top().first;
             int list_index = pq.top().second;
             pq.pop();
 
             double score = 0;
 
-            // Check if doc_id is within the range of doc_lengths
-            if (doc_id < 0 || doc_id >= doc_lengths.size())
+            // Check if cur_doc_id is within the range of doc_lengths
+            if (cur_doc_id < 0 || cur_doc_id >= doc_lengths.size())
             {
-                std::cerr << "Invalid doc_id: " << doc_id << std::endl;
+                std::cerr << "Invalid cur_doc_id: " << cur_doc_id << std::endl;
                 continue;
             }
 
-            int doc_length = doc_lengths[doc_id];
+            int doc_length = doc_lengths[cur_doc_id];
 
             for (size_t i = 0; i < lists.size(); ++i)
             {
-                if (doc_ids[i] == doc_id)
+                if (doc_ids[i] == cur_doc_id) // if the list is at the cur_doc_id
                 {
-                    double idf = computeIDF(lists[i].getSize());
+                    double idf = computeIDF(lexicon[term_id_to_word[i]].postings_num);
                     double tf = computeTF(freqs[i], doc_length);
+                    std::cout << "IDF: " << idf << ", TF: " << tf << std::endl;
                     score += idf * tf;
 
-                    if (lists[i].next(doc_ids[i], freqs[i]))
+                    if (lists[i].next(doc_ids[i], freqs[i])) // if the list is not exhausted
                     {
                         pq.push({-doc_ids[i], i});
                     }
                 }
             }
 
-            results.push_back({doc_id, score});
+            results.push_back({cur_doc_id, score});
         }
 
         return results;
@@ -500,33 +518,28 @@ uint32_t varbyteDecode(const std::vector<uint8_t> &bytes)
     return number;
 }
 
-size_t varbyteEncodedSize(int value)
+int32_t varbyteDecode(const uint8_t *data, size_t &bytes_read)
 {
-    size_t size = 0;
-    do
+    if (data == nullptr)
     {
-        value >>= 7;
-        size++;
-    } while (value > 0);
-    return size;
-}
+        std::cerr << "Data is nullptr" << std::endl;
+        return 0;
+    }
 
-int varbyteDecode(const uint8_t *data, size_t &bytes_read)
-{
-    int result = 0;
+    int32_t result = 0;
     bytes_read = 0; // Reset the byte count for this decoding
     int shift = 0;  // Shift to combine 7-bit parts of each byte
 
     while (true)
     {
         uint8_t byte = data[bytes_read];
-        result |= (byte & 0x7F) << shift; // Extract the lower 7 bits and shift into place
-        shift += 7;                       // Prepare to add the next 7 bits
+        result |= ((byte & 0x7F) << shift); // Extract the lower 7 bits and shift into place
+        shift += 7;                         // Prepare to add the next 7 bits
 
         bytes_read++; // Move to the next byte
 
-        // If the MSB is 1, it's the last byte of this number, break out of the loop
-        if (byte & 0x80)
+        // If the MSB is 0, it's the last byte of this number, break out of the loop
+        if ((byte & 0x80) == 0)
         {
             break;
         }
