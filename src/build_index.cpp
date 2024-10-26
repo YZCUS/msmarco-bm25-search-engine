@@ -271,7 +271,14 @@ void processTarGz(const std::string &filename, int chunk_size)
                     }
                     // std::cout << "line: " << line << std::endl;
                     // std::cin.get();
-                    size_t memory_increment = processLine(line, document_info, index, lexicon, term_id_to_word, last_doc_id, term_id, line_position);
+                    size_t memory_increment = processLine(line,
+                                                          document_info,
+                                                          index,
+                                                          lexicon,
+                                                          term_id_to_word,
+                                                          last_doc_id,
+                                                          term_id,
+                                                          line_position);
                     line_position += line.size() + 1; // +1 for '\n'
                     current_memory_usage += memory_increment;
 
@@ -287,7 +294,14 @@ void processTarGz(const std::string &filename, int chunk_size)
             // process the last incomplete line
             if (!leftover.empty() && last_doc_id < SMALL_DOC_TEST)
             {
-                size_t memory_increment = processLine(leftover, document_info, index, lexicon, term_id_to_word, last_doc_id, term_id, line_position);
+                size_t memory_increment = processLine(leftover,
+                                                      document_info,
+                                                      index,
+                                                      lexicon,
+                                                      term_id_to_word,
+                                                      last_doc_id,
+                                                      term_id,
+                                                      line_position);
                 current_memory_usage += memory_increment;
             }
 
@@ -456,7 +470,8 @@ void externalSort(int num_files,
     int last_doc_id = 0;
 
     const int POSTING_PER_BLOCK = 128;
-    std::vector<std::pair<int, std::pair<int64_t, int64_t>>> block_info; // store last_doc_id, doc_id_size(bytes), and freq_size(bytes)
+    std::vector<std::pair<int, std::pair<int64_t, int64_t>>> block_info; 
+    // store last_doc_id, doc_id_size(bytes), and freq_size(bytes)
     std::vector<uint8_t> merged_doc_ids;
     std::vector<uint8_t> merged_counts;
     int postings_in_block = 0; // track number of postings in the current block

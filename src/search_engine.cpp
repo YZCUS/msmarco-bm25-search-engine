@@ -99,12 +99,14 @@ private:
         {
             return false;
         }
-
+        current_block_.clear(); // close the current block
         return openBlock();
     }
 
 public:
-    InvertedList(std::ifstream &index_file, int64_t start_pos, int64_t bytes_size, std::vector<std::pair<int, std::pair<int64_t, std::pair<int64_t, int64_t>>>> &block_info)
+    InvertedList(std::ifstream &index_file, int64_t start_pos,
+                 int64_t bytes_size,
+                 std::vector<std::pair<int, std::pair<int64_t, std::pair<int64_t, int64_t>>>> &block_info)
         : index_file_(index_file), start_pos_(start_pos), bytes_size_(bytes_size), block_info_(block_info)
     {
         std::cout << "Inverted list initialized. Start pos: " << start_pos_ << ", Size: " << bytes_size_ << " bytes." << std::endl;
@@ -140,7 +142,8 @@ public:
             return loadNextBlock();
         }
 
-        while (block_doc_id_reader < start_pos_ && block_doc_id_reader < block_doc_id_size + block_freq_size + block_info_[current_block_index_].second.first)
+        while (block_doc_id_reader < start_pos_ && block_doc_id_reader <
+                                                       block_doc_id_size + block_freq_size + block_info_[current_block_index_].second.first)
         {
             bytes_read = 0;
 
@@ -227,58 +230,8 @@ public: // public members
         loadDocInfo(doc_info_file);
     }
 
-    void loadLexicon(const std::string &lexicon_file)
-    {
-        std::ifstream lex_file(lexicon_file);
-        std::unordered_map<int, std::string> term_id_to_word;
-        std::string term;
-        LexiconEntry entry;
-        std::cout << "Loading lexicon..." << std::endl;
-        while (lex_file >> term >> entry.term_id >> entry.postings_num >> entry.start_position >> entry.bytes_size) // tested
-        {
-            lexicon[term] = entry;
-            term_id_to_word[entry.term_id] = term;
-        }
-        std::cout << "Lexicon loaded." << std::endl;
-    }
-
-    void loadBlockInfo(const std::string &block_info_file)
-    {
-        std::cout << "Loading block info..." << std::endl;
-        std::ifstream block_info(block_info_file);
-        int last_doc_id = 0;
-        int64_t block_start_pos = 0;
-        int64_t block_doc_id_size = 0;
-        int64_t block_freq_size = 0;
-        while (block_info >> last_doc_id >> block_doc_id_size >> block_freq_size) // tested
-        {
-            // std::cout << "Block info: " << last_doc_id << " " << block_doc_id_size << " " << block_freq_size << std::endl;
-            block.push_back({last_doc_id, {block_start_pos, {block_doc_id_size, block_freq_size}}});
-            block_start_pos += block_doc_id_size + block_freq_size;
-        }
-        std::cout << "Block info loaded." << std::endl;
-    }
-
-    void loadDocInfo(const std::string &doc_info_file)
-    {
-        std::cout << "Loading doc info..." << std::endl;
-        std::ifstream doc_info(doc_info_file);
-        int total_length = 0;
-        int total_docs = 0;
-        int doc_length;
-        int64_t line_pos;
-        while (doc_info >> doc_length >> line_pos) // tested
-        {
-            doc_lengths.push_back(doc_length);
-            total_length += doc_length;
-            ++total_docs;
-            lines_pos.push_back(line_pos);
-        }
-        avg_doc_length = static_cast<double>(total_length) / total_docs;
-        std::cout << "Doc info loaded." << std::endl;
-    }
-
     std::vector<SearchResult> search(const std::string &query, bool conjunctive)
+
     {
         // process the query
         std::cout << "Processing query..." << std::endl;
@@ -332,6 +285,57 @@ public: // public members
     }
 
 private: // private methods
+    void loadLexicon(const std::string &lexicon_file)
+    {
+        std::ifstream lex_file(lexicon_file);
+        std::unordered_map<int, std::string> term_id_to_word;
+        std::string term;
+        LexiconEntry entry;
+        std::cout << "Loading lexicon..." << std::endl;
+        while (lex_file >> term >> entry.term_id >> entry.postings_num >> entry.start_position >> entry.bytes_size) // tested
+        {
+            lexicon[term] = entry;
+            term_id_to_word[entry.term_id] = term;
+        }
+        std::cout << "Lexicon loaded." << std::endl;
+    }
+
+    void loadBlockInfo(const std::string &block_info_file)
+    {
+        std::cout << "Loading block info..." << std::endl;
+        std::ifstream block_info(block_info_file);
+        int last_doc_id = 0;
+        int64_t block_start_pos = 0;
+        int64_t block_doc_id_size = 0;
+        int64_t block_freq_size = 0;
+        while (block_info >> last_doc_id >> block_doc_id_size >> block_freq_size) // tested
+        {
+            // std::cout << "Block info: " << last_doc_id << " " << block_doc_id_size << " " << block_freq_size << std::endl;
+            block.push_back({last_doc_id, {block_start_pos, {block_doc_id_size, block_freq_size}}});
+            block_start_pos += block_doc_id_size + block_freq_size;
+        }
+        std::cout << "Block info loaded." << std::endl;
+    }
+
+    void loadDocInfo(const std::string &doc_info_file)
+    {
+        std::cout << "Loading doc info..." << std::endl;
+        std::ifstream doc_info(doc_info_file);
+        int total_length = 0;
+        int total_docs = 0;
+        int doc_length;
+        int64_t line_pos;
+        while (doc_info >> doc_length >> line_pos) // tested
+        {
+            doc_lengths.push_back(doc_length);
+            total_length += doc_length;
+            ++total_docs;
+            lines_pos.push_back(line_pos);
+        }
+        avg_doc_length = static_cast<double>(total_length) / total_docs;
+        std::cout << "Doc info loaded." << std::endl;
+    }
+
     std::vector<std::string> processQuery(const std::string &query)
     {
         std::vector<std::string> terms;
