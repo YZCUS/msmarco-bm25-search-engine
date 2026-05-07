@@ -1,0 +1,12 @@
+{
+  "qrels": "/Users/zhengchy/documents/projects/build_inverted_index/data/2019qrels-pass.txt",
+  "run": "/Users/zhengchy/documents/projects/build_inverted_index/runs/dl19.run",
+  "metrics": {
+    "map": 0.3507078513981883,
+    "recip_rank": 0.7446059431524548,
+    "recall_1000": 0.684755260828466,
+    "ndcg_cut_10": 0.44153467764583726,
+    "mrr_cut_10": 0.7444444444444444,
+    "num_queries": 43
+  }
+}

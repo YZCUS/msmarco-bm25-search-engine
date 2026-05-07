@@ -1,0 +1,4 @@
+# Place nlohmann/json's single-header (json.hpp) here during P5.
+# Download:
+#   curl -L -o include/third_party/json.hpp \
+#     https://github.com/nlohmann/json/releases/latest/download/json.hpp

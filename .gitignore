@@ -1,52 +1,71 @@
-# ignore large data file
+# Large datasets (MS MARCO) and runtime artifacts
+data/
 src/collection.tar.gz
+collection.tar.gz
 
-# ignore build folder
+# Build directories
 /build/
-
-# ignore compiled files
+/build-*/
+/build*/
 *.o
 *.out
 *.exe
+*.dSYM/
+*.profraw
+*.profdata
 
-# ignore IDE and editor generated files
+# Generated index artifacts
+*.bin
+final_sorted_index.bin
+final_sorted_block_info.bin
+final_sorted_block_info2.txt
+final_sorted_lexicon.txt
+final_sorted_index2.txt
+document_info.txt
+temp_index_*.bin
+runs/
+bench_results/
+encoded_numbers.bin
+*.run
+
+# IDE / editor
 .vscode/
 .idea/
 *.swp
 *~
 
-# ignore OS generated files
+# OS
 .DS_Store
 Thumbs.db
 
-# ignore CMake generated files
+# CMake
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
 
-# ignore log files
-*.log
+# Python
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.egg-info/
 
-# ignore temporary files
+# Logs & temp
+*.log
 *.tmp
 *.temp
 
-# ignore config files
+# Secrets
 config.ini
 secrets.json
+.env
 
-# ignore compressed files
+# Compressed archives & generated docs
 *.zip
 *.rar
 *.7z
-
-# ignore all .tar.gz files
 *.tar.gz
-
-# ignore generated documents
 /doc/
-
-# ignore node_modules and vendor
 /node_modules/
 /vendor/

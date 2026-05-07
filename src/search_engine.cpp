@@ -1,593 +1,387 @@
-#include <iostream>
-#include <fstream>
-#include <vector>
-#include <string>
-#include <unordered_map>
+// SearchEngine implementation: PIMPL-based, mmap-backed, thread-pool-driven.
+//
+// This file replaces the legacy global-namespace SearchEngine in
+// src/search_engine.cpp. Once P1 is done the legacy file will be deleted and
+// this file renamed to src/search_engine.cpp.
+
+#include "search_engine.hpp"
+
 #include <algorithm>
-#include <queue>
-#include <cmath>
-#include <sstream>
 #include <cstdint>
-#include <zlib.h>
+#include <exception>
+#include <fstream>
+#include <future>
+#include <mutex>
+#include <queue>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <unordered_set>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
-const int POSTING_PER_BLOCK = 128;
-const std::string LEXICON_FILE = "final_sorted_lexicon.txt";
-const std::string INDEX_FILE = "final_sorted_index.bin";
-const std::string DOC_INFO_FILE = "document_info.txt";
-const std::string BLOCK_INFO_FILE = "final_sorted_block_info2.txt";
-const std::string ORIGINAL_TAR_GZ = "../src/collection.tar.gz";
+#include "bm25.hpp"
+#include "inverted_list.hpp"
+#include "log.hpp"
+#include "mmap_file.hpp"
+#include "posting.hpp"
+#include "thread_pool.hpp"
+#include "tokenizer.hpp"
 
-// parameters
-const double k1 = 1.2;
-const double b = 0.75;
+namespace idx::query {
 
-// decode function
-uint32_t varbyteDecode(const std::vector<uint8_t> &bytes);
-int varbyteDecode(const uint8_t *data, size_t &bytes_read);
+namespace {
 
-struct LexiconEntry
-{
+struct LexEntry {
     int term_id;
-    int postings_num;
-    int64_t start_position;
-    int64_t bytes_size;
+    int df;
+    std::int64_t start_position;
+    std::int64_t bytes_size;
 };
 
-struct SearchResult
-{
-    int doc_id;
-    double score;
-};
-
-class InvertedList
-{
-private:
-    std::ifstream &index_file_;
-    int64_t start_pos_;
-    int64_t bytes_size_;
-    int64_t block_doc_id_reader;
-    int64_t block_doc_id_size;
-    int64_t block_freq_reader;
-    int64_t block_freq_size;
-    std::vector<std::pair<int, std::pair<int64_t, std::pair<int64_t, int64_t>>>> &block_info_;
-    std::vector<uint8_t> current_block_;
-    int current_block_index_;
-
-    void loadBlockIndex()
-    {
-        std::cout << "Loading block index." << std::endl;
-        if (current_block_index_ == -1)
-        {
-
-            for (int i = 0; i < block_info_.size(); ++i)
-            {
-                if (start_pos_ < block_info_[i].second.first)
-                {
-                    current_block_index_ = i - 1;
-                    break;
-                }
-            }
-        }
-        else
-        {
-            current_block_index_++;
-        }
-        std::cout << "Block index loaded. Current block index: " << current_block_index_ << std::endl;
+void load_lexicon(const std::string& path,
+                  std::unordered_map<std::string, LexEntry>& out) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("load_lexicon: cannot open " + path);
+    std::string term;
+    LexEntry e{};
+    while (in >> term >> e.term_id >> e.df >> e.start_position >> e.bytes_size) {
+        out.emplace(std::move(term), e);
+        term.clear();
     }
+}
 
-    bool openBlock()
-    {
-        std::cout << "Opening block." << std::endl;
-        block_doc_id_reader = block_info_[current_block_index_].second.first;
-        block_doc_id_size = block_info_[current_block_index_].second.second.first;
-        block_freq_reader = block_doc_id_reader + block_doc_id_size;
-        block_freq_size = block_info_[current_block_index_].second.second.second;
-        index_file_.seekg(block_doc_id_reader);
-        int64_t block_size = block_doc_id_size + block_freq_size;
-        bytes_size_ -= block_size;
-        current_block_.resize(block_size);
-        index_file_.read(reinterpret_cast<char *>(current_block_.data()), block_size); // read the block into memory
-        return bytes_size_ + block_size >= 0;
+void load_block_info(const std::string& path, std::vector<BlockMeta>& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("load_block_info: cannot open " + path);
+    std::int64_t cumulative = 0;
+    BlockMeta m{};
+    while (in.read(reinterpret_cast<char*>(&m.last_doc_id), sizeof(m.last_doc_id)) &&
+           in.read(reinterpret_cast<char*>(&m.doc_id_size), sizeof(m.doc_id_size)) &&
+           in.read(reinterpret_cast<char*>(&m.freq_size), sizeof(m.freq_size))) {
+        if (m.doc_id_size <= 0 || m.freq_size <= 0) {
+            throw std::runtime_error("load_block_info: invalid block size in " + path);
+        }
+        m.start_offset = cumulative;
+        cumulative += m.doc_id_size + m.freq_size;
+        out.push_back(m);
     }
+}
 
-    bool loadNextBlock()
-    {
-        std::cout << "Loading next block." << std::endl;
-        loadBlockIndex();
-
-        if (current_block_index_ == block_info_.size()) // no more blocks
-        {
-            return false;
-        }
-        current_block_.clear(); // close the current block
-        return openBlock();
+void load_doc_info(const std::string& path,
+                   std::vector<int>& doc_lengths,
+                   std::vector<std::int64_t>& line_positions,
+                   double& avgdl_out) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("load_doc_info: cannot open " + path);
+    long long total_len = 0;
+    int dl = 0;
+    std::int64_t pos = 0;
+    while (in >> dl >> pos) {
+        doc_lengths.push_back(dl);
+        line_positions.push_back(pos);
+        total_len += dl;
     }
-
-public:
-    InvertedList(std::ifstream &index_file, int64_t start_pos,
-                 int64_t bytes_size,
-                 std::vector<std::pair<int, std::pair<int64_t, std::pair<int64_t, int64_t>>>> &block_info)
-        : index_file_(index_file), start_pos_(start_pos), bytes_size_(bytes_size), block_info_(block_info)
-    {
-        std::cout << "Inverted list initialized. Start pos: " << start_pos_ << ", Size: " << bytes_size_ << " bytes." << std::endl;
-        block_doc_id_reader = -1;
-        current_block_index_ = -1;
+    if (doc_lengths.empty()) {
+        avgdl_out = 0.0;
+    } else {
+        avgdl_out = static_cast<double>(total_len) /
+                    static_cast<double>(doc_lengths.size());
     }
+}
 
-    bool next(int &doc_id, int &freq)
-    {
-        if (current_block_index_ == -1 || block_freq_reader >= block_info_[current_block_index_].second.first + block_doc_id_size + block_freq_size)
-        {
-            if (!loadNextBlock())
-            {
-                std::cout << "No more blocks." << std::endl;
-                return false;
-            }
-        }
+std::vector<std::string> tokenize_query(std::string_view q) {
+    std::vector<std::string> out;
+    idx::token::tokenize(q, out);
+    // Query-time stopword filtering keeps high-df terms like "what" and "is"
+    // from forcing a full scan of enormous posting lists. The index still
+    // stores these terms, so this is a search-policy choice rather than an
+    // indexing-format change.
+    auto is_stopword = [](const std::string& t) {
+        static const std::unordered_set<std::string> kStopwords = {
+            "a", "an", "and", "are", "as", "at", "be", "by", "for",
+            "from", "how", "in", "is", "it", "of", "on", "or", "that",
+            "the", "to", "was", "what", "when", "where", "which", "who",
+            "whom", "why", "with", "without", "do", "does", "did", "can",
+            "could", "would", "should", "this", "these", "those",
+        };
+        return kStopwords.find(t) != kStopwords.end();
+    };
+    out.erase(std::remove_if(out.begin(), out.end(), is_stopword), out.end());
+    return out;
+}
 
-        size_t bytes_read = 0;
-        std::cout << "Start to find next" << std::endl;
-        // Count the number of doc_ids we need to skip, moving both doc_id and freq readers
-        std::cout << "Block doc id reader: " << block_doc_id_reader << std::endl;
-        std::cout << "Start pos: " << start_pos_ << std::endl;
+}  // namespace
 
-        // check if the doc_id reader is out of range
-        size_t relative_pos = block_doc_id_reader - block_info_[current_block_index_].second.first;
-        std::cout << "Relative pos: " << relative_pos << std::endl;
-        std::cout << "Current block size: " << current_block_.size() << std::endl;
-
-        if (relative_pos >= current_block_.size())
-        {
-            std::cerr << "Relative pos is out of range" << std::endl;
-            return loadNextBlock();
-        }
-
-        while (block_doc_id_reader < start_pos_ && block_doc_id_reader <
-                                                       block_doc_id_size + block_freq_size + block_info_[current_block_index_].second.first)
-        {
-            bytes_read = 0;
-
-            // Calculate the relative position of block_doc_id_reader within the current block
-            const uint8_t *doc_id_ptr = current_block_.data() + relative_pos;
-
-            if (relative_pos >= block_doc_id_size + block_freq_size)
-            {
-                std::cerr << "Relative pos is out of range" << std::endl;
-                return loadNextBlock();
-            }
-
-            while ((doc_id_ptr[bytes_read] & 0x80)) // MSB is 1, meaning this is not the last byte
-            {
-                bytes_read++;
-            }
-            bytes_read++;
-
-            block_doc_id_reader += bytes_read;
-
-            // move the frequency reader by the corresponding number of bytes
-            bytes_read = 0;
-
-            const uint8_t *freq_ptr = current_block_.data() + (block_freq_reader - block_info_[current_block_index_].second.first);
-
-            // read until we find the last byte of the current frequency
-            while ((freq_ptr[bytes_read] & 0x80)) // MSB is 1, meaning this is not the last byte
-            {
-                bytes_read++;
-            }
-            bytes_read++;
-
-            block_freq_reader += bytes_read;
-        }
-
-        // Decode the next doc_id difference
-        const uint8_t *doc_id_ptr = current_block_.data() + (block_doc_id_reader - block_info_[current_block_index_].second.first); // Pointer within the current block
-        int32_t doc_id_diff = varbyteDecode(doc_id_ptr, bytes_read);                                                                // Decode using the block-relative pointer
-        block_doc_id_reader += bytes_read;                                                                                          // Update the reader position by bytes_read
-        std::cout << "Doc ID diff: " << doc_id_diff << std::endl;
-
-        if (block_freq_reader + bytes_read >= block_info_[current_block_index_].second.first + block_doc_id_size + block_freq_size)
-        {
-            std::cerr << "Block freq reader is out of range" << std::endl;
-            return loadNextBlock();
-        }
-
-        // Decode the corresponding frequency
-        bytes_read = 0;                                                                                                         // Reset bytes_read for frequency decoding
-        const uint8_t *freq_ptr = current_block_.data() + (block_freq_reader - block_info_[current_block_index_].second.first); // Pointer within the current block
-        freq = varbyteDecode(freq_ptr, bytes_read);                                                                             // Decode using the block-relative pointer
-        block_freq_reader += bytes_read;                                                                                        // Update the reader position by bytes_read
-        std::cout << "Frequency: " << freq << std::endl;
-
-        // Update the doc_id with the decoded difference
-        doc_id += doc_id_diff;
-        std::cout << "doc_id: " << doc_id << std::endl;
-
-        return true;
-    }
-};
-
-class SearchEngine
-{
-private: // private members
-    std::unordered_map<std::string, LexiconEntry> lexicon;
-    std::vector<std::pair<int, std::pair<int64_t, std::pair<int64_t, int64_t>>>> block;
-    std::unordered_map<int, std::string> term_id_to_word;
-    std::ifstream index_file;
-    std::ifstream doc_info_file;
-    std::ifstream original_file;
-    std::vector<int64_t> lines_pos;
+struct SearchEngine::Impl {
+    SearchEnginePaths paths;
+    idx::io::MmapFile index_file;
+    std::unordered_map<std::string, LexEntry> lexicon;
+    std::vector<BlockMeta> blocks;
     std::vector<int> doc_lengths;
-    int total_docs;
-    double avg_doc_length;
+    std::vector<std::int64_t> line_positions;
+    int total_docs = 0;
+    double avgdl = 0.0;
 
-public: // public members
-    SearchEngine(const std::string &lexicon_file, const std::string &index_file,
-                 const std::string &doc_info_file, const std::string &block_info_file, const std::string &original_tar_gz)
-        : index_file(index_file, std::ios::binary), original_file(original_tar_gz, std::ios::binary)
-    {
-        loadLexicon(lexicon_file);
-        loadBlockInfo(block_info_file);
-        loadDocInfo(doc_info_file);
+    std::unique_ptr<idx::concurrent::ThreadPool> pool;
+
+    // Guards collection-file reads when filling passages from disk.
+    mutable std::mutex collection_mutex;
+    mutable std::ifstream collection_stream;
+
+    explicit Impl(const SearchEnginePaths& p, unsigned threads)
+        : paths(p), index_file(idx::io::MmapFile::open_readonly(p.index_file)) {
+        load_lexicon(p.lexicon_file, lexicon);
+        load_block_info(p.block_info_file, blocks);
+        load_doc_info(p.doc_info_file, doc_lengths, line_positions, avgdl);
+        total_docs = static_cast<int>(doc_lengths.size());
+        IDX_LOG("SearchEngine loaded: docs=" << total_docs
+                << " avgdl=" << avgdl
+                << " terms=" << lexicon.size()
+                << " blocks=" << blocks.size());
+        if (threads > 0) pool = std::make_unique<idx::concurrent::ThreadPool>(threads);
+        if (!paths.collection_file.empty()) {
+            collection_stream.open(paths.collection_file, std::ios::binary);
+        }
     }
 
-    std::vector<SearchResult> search(const std::string &query, bool conjunctive)
+    std::vector<idx::SearchResult> search(std::string_view query,
+                                          SearchOptions opts) const;
+    std::vector<idx::SearchResult> rank_disjunctive(
+        const std::vector<const LexEntry*>& terms, int top_k) const;
+    std::vector<idx::SearchResult> rank_conjunctive(
+        const std::vector<const LexEntry*>& terms, int top_k) const;
+    void fill_passages(std::vector<idx::SearchResult>& results) const;
+};
 
-    {
-        // process the query
-        std::cout << "Processing query..." << std::endl;
-        std::vector<std::string> terms = processQuery(query);
-        std::cout << "Query processed." << std::endl;
-        std::vector<InvertedList> lists;
-        // find the inverted lists for the terms
-        for (const auto &term : terms)
-        {
-            std::cout << "Searching for term: " << term << std::endl;
-            if (lexicon.find(term) != lexicon.end())
-            {
-                std::cout << "Found term: " << term << std::endl;
-                const auto &entry = lexicon[term];
-                lists.emplace_back(index_file, entry.start_position, entry.bytes_size, block);
-                std::cout << "Inverted list found for term: " << term << std::endl;
-                std::cout << "The term starts at: " << entry.start_position << " with size: " << entry.bytes_size << std::endl;
-            }
-            else
-            {
-                std::cout << "Term not found: " << term << std::endl;
-            }
-        }
+namespace {
 
-        // if no lists are found, return empty vector
-        if (lists.empty())
-            return {};
-
-        std::vector<SearchResult> results;
-        if (conjunctive)
-        {
-            results = conjunctiveSearch(lists);
-        }
-        else
-        {
-            results = disjunctiveSearch(lists);
-        }
-
-        std::sort(results.begin(), results.end(),
-                  [](const SearchResult &a, const SearchResult &b)
-                  { return a.score > b.score; });
-        if (results.size() > 10)
-            results.resize(10);
-        std::vector<int> result_doc_ids;
-        for (const auto &result : results)
-        {
-            result_doc_ids.push_back(result.doc_id);
-        }
-
-        return results;
+void finalize_top_k(std::vector<idx::SearchResult>& results, int top_k) {
+    if (top_k <= 0) {
+        results.clear();
+        return;
     }
-
-private: // private methods
-    void loadLexicon(const std::string &lexicon_file)
-    {
-        std::ifstream lex_file(lexicon_file);
-        std::unordered_map<int, std::string> term_id_to_word;
-        std::string term;
-        LexiconEntry entry;
-        std::cout << "Loading lexicon..." << std::endl;
-        while (lex_file >> term >> entry.term_id >> entry.postings_num >> entry.start_position >> entry.bytes_size) // tested
-        {
-            lexicon[term] = entry;
-            term_id_to_word[entry.term_id] = term;
-        }
-        std::cout << "Lexicon loaded." << std::endl;
+    std::sort(results.begin(), results.end(),
+              [](const idx::SearchResult& a, const idx::SearchResult& b) {
+                  if (a.score != b.score) return a.score > b.score;
+                  return a.doc_id < b.doc_id;
+              });
+    if (static_cast<int>(results.size()) > top_k) results.resize(top_k);
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        results[i].rank = static_cast<int>(i) + 1;
     }
+}
 
-    void loadBlockInfo(const std::string &block_info_file)
-    {
-        std::cout << "Loading block info..." << std::endl;
-        std::ifstream block_info(block_info_file);
-        int last_doc_id = 0;
-        int64_t block_start_pos = 0;
-        int64_t block_doc_id_size = 0;
-        int64_t block_freq_size = 0;
-        while (block_info >> last_doc_id >> block_doc_id_size >> block_freq_size) // tested
-        {
-            // std::cout << "Block info: " << last_doc_id << " " << block_doc_id_size << " " << block_freq_size << std::endl;
-            block.push_back({last_doc_id, {block_start_pos, {block_doc_id_size, block_freq_size}}});
-            block_start_pos += block_doc_id_size + block_freq_size;
-        }
-        std::cout << "Block info loaded." << std::endl;
-    }
+bool is_better(const idx::SearchResult& a, const idx::SearchResult& b) {
+    if (a.score != b.score) return a.score > b.score;
+    return a.doc_id < b.doc_id;
+}
 
-    void loadDocInfo(const std::string &doc_info_file)
-    {
-        std::cout << "Loading doc info..." << std::endl;
-        std::ifstream doc_info(doc_info_file);
-        int total_length = 0;
-        int total_docs = 0;
-        int doc_length;
-        int64_t line_pos;
-        while (doc_info >> doc_length >> line_pos) // tested
-        {
-            doc_lengths.push_back(doc_length);
-            total_length += doc_length;
-            ++total_docs;
-            lines_pos.push_back(line_pos);
-        }
-        avg_doc_length = static_cast<double>(total_length) / total_docs;
-        std::cout << "Doc info loaded." << std::endl;
-    }
-
-    std::vector<std::string> processQuery(const std::string &query)
-    {
-        std::vector<std::string> terms;
-        std::istringstream iss(query);
-        std::string term;
-        while (iss >> term)
-        {
-            std::string current_word;
-            for (auto &c : term)
-            {
-                if (std::isalpha(c))
-                {
-                    current_word += std::tolower(c);
-                }
-                else if (std::isdigit(c))
-                {
-                    current_word += c;
-                }
-                else if (!current_word.empty())
-                {
-                    terms.push_back(current_word);
-                    current_word.clear();
-                }
-            }
-            if (!current_word.empty())
-            {
-                terms.push_back(current_word);
-            }
-        }
-        std::cout << "Query terms: ";
-        for (const auto &term : terms)
-        {
-            std::cout << term << " ";
-        }
-        std::cout << std::endl;
-        return terms;
-    }
-
-    double computeIDF(int term_freq)
-    {
-        return std::log((total_docs - term_freq + 0.5) / (term_freq + 0.5) + 1.0);
-    }
-
-    double computeTF(int freq, int doc_length)
-    {
-        return (freq * (k1 + 1)) / (freq + k1 * (1 - b + b * (doc_length / avg_doc_length)));
-    }
-
-    std::vector<SearchResult> conjunctiveSearch(std::vector<InvertedList> &lists)
-    {
-        std::cout << "Conjunctive search..." << std::endl;
-        std::vector<SearchResult> results;
-        int current_doc = 0;
-        std::vector<int> doc_ids(lists.size(), 0);
-        std::vector<int> freqs(lists.size(), 0);
-
-        while (true)
-        {
-            bool all_same_value = true;
-            int max_doc_id = -1;                   // Start with an invalid doc_id value
-            bool at_least_one_list_active = false; // To track if any list is still active
-
-            // Process each inverted list
-            for (size_t i = 0; i < lists.size(); ++i)
-            {
-                // Advance the list until we find a doc_id >= current_doc
-                while (doc_ids[i] < current_doc && lists[i].next(doc_ids[i], freqs[i]))
-                    ; // update doc_ids until it >= current_doc
-
-                std::cout << "Doc ID: " << doc_ids[i] << ", Freq: " << freqs[i] << std::endl;
-
-                if (doc_ids[i] != current_doc)
-                    all_same_value = false;
-
-                // Only consider active lists
-                if (lists[i].next(doc_ids[i], freqs[i]))
-                {
-                    at_least_one_list_active = true;
-
-                    // Find the maximum doc_id across all lists
-                    if (doc_ids[i] > max_doc_id)
-                        max_doc_id = doc_ids[i];
-                }
-            }
-
-            // If no list is active anymore, stop the search
-            if (!at_least_one_list_active)
-                break;
-
-            // If all lists have the same doc_id, calculate the score and move to the next document
-            if (all_same_value)
-            {
-                if (current_doc < doc_lengths.size()) // Ensure doc_lengths[current_doc] is valid
-                {
-                    std::cout << "All lists have the same doc_id: " << current_doc << std::endl;
-                    double score = 0;
-                    int doc_length = doc_lengths[current_doc];
-                    for (size_t i = 0; i < lists.size(); ++i)
-                    {
-                        double idf = computeIDF(lexicon[term_id_to_word[i]].postings_num);
-                        double tf = computeTF(freqs[i], doc_length);
-                        std::cout << "IDF: " << idf << ", TF: " << tf << std::endl;
-
-                        score += idf * tf;
-                    }
-                    results.push_back({current_doc, score});
-                }
-                ++current_doc; // Increment to the next doc
-            }
-            else
-            {
-                // Move to the largest doc_id found across the lists to continue
-                current_doc = max_doc_id;
-            }
-
-            // Exit condition: stop when the current doc_id exceeds total_docs
-            if (current_doc >= total_docs || max_doc_id == -1)
-                break;
-        }
-
-        return results;
-    }
-
-    std::vector<SearchResult> disjunctiveSearch(std::vector<InvertedList> &lists)
-    {
-        std::cout << "Disjunctive search..." << std::endl;
-        std::vector<SearchResult> results;
-        std::vector<int> doc_ids(lists.size(), 0);
-        std::vector<int> freqs(lists.size(), 0);
-        std::priority_queue<std::pair<int, int>> pq;
-        std::cout << "Disjunctive search initialized." << std::endl;
-        for (size_t i = 0; i < lists.size(); ++i)
-        {
-            if (lists[i].next(doc_ids[i], freqs[i]))
-            {
-                pq.push({-doc_ids[i], i});
-            }
-        }
-
-        while (!pq.empty())
-        {
-            int cur_doc_id = -pq.top().first;
-            int list_index = pq.top().second;
-            pq.pop();
-
-            double score = 0;
-
-            // Check if cur_doc_id is within the range of doc_lengths
-            if (cur_doc_id < 0 || cur_doc_id >= doc_lengths.size())
-            {
-                std::cerr << "Invalid cur_doc_id: " << cur_doc_id << std::endl;
-                continue;
-            }
-
-            int doc_length = doc_lengths[cur_doc_id];
-
-            for (size_t i = 0; i < lists.size(); ++i)
-            {
-                if (doc_ids[i] == cur_doc_id) // if the list is at the cur_doc_id
-                {
-                    double idf = computeIDF(lexicon[term_id_to_word[i]].postings_num);
-                    double tf = computeTF(freqs[i], doc_length);
-                    std::cout << "IDF: " << idf << ", TF: " << tf << std::endl;
-                    score += idf * tf;
-
-                    if (lists[i].next(doc_ids[i], freqs[i])) // if the list is not exhausted
-                    {
-                        pq.push({-doc_ids[i], i});
-                    }
-                }
-            }
-
-            results.push_back({cur_doc_id, score});
-        }
-
-        return results;
+struct WorstResultFirst {
+    bool operator()(const idx::SearchResult& a, const idx::SearchResult& b) const {
+        return is_better(a, b);
     }
 };
 
-// Varbyte decode function
-uint32_t varbyteDecode(const std::vector<uint8_t> &bytes)
-{
-    uint32_t number = 0;
-    for (int i = bytes.size() - 1; i >= 0; --i)
-    {
-        number = (number << 7) | (bytes[i] & 127);
+using TopKHeap = std::priority_queue<
+    idx::SearchResult,
+    std::vector<idx::SearchResult>,
+    WorstResultFirst>;
+
+void push_top_k(TopKHeap& heap, idx::SearchResult result, int top_k) {
+    if (top_k <= 0) return;
+    if (static_cast<int>(heap.size()) < top_k) {
+        heap.push(std::move(result));
+        return;
     }
-    return number;
+    if (is_better(result, heap.top())) {
+        heap.pop();
+        heap.push(std::move(result));
+    }
 }
 
-int32_t varbyteDecode(const uint8_t *data, size_t &bytes_read)
-{
-    if (data == nullptr)
-    {
-        std::cerr << "Data is nullptr" << std::endl;
-        return 0;
+std::vector<idx::SearchResult> drain_top_k(TopKHeap& heap, int top_k) {
+    std::vector<idx::SearchResult> results;
+    results.reserve(heap.size());
+    while (!heap.empty()) {
+        results.push_back(std::move(heap.top()));
+        heap.pop();
+    }
+    finalize_top_k(results, top_k);
+    return results;
+}
+
+}  // namespace
+
+std::vector<idx::SearchResult> SearchEngine::Impl::rank_disjunctive(
+    const std::vector<const LexEntry*>& terms, int top_k) const {
+    if (top_k <= 0) return {};
+
+    std::vector<InvertedList> lists;
+    lists.reserve(terms.size());
+    for (const auto* e : terms) {
+        lists.emplace_back(index_file.data(), e->start_position, e->bytes_size,
+                           e->df, blocks);
+    }
+    for (auto& l : lists) l.advance();
+
+    TopKHeap top;
+
+    while (true) {
+        // Find the smallest doc_id present in any positioned list.
+        int min_did = INT32_MAX;
+        for (const auto& l : lists) {
+            if (l.positioned() && l.doc_id() < min_did) min_did = l.doc_id();
+        }
+        if (min_did == INT32_MAX) break;
+
+        double s = 0.0;
+        for (std::size_t i = 0; i < lists.size(); ++i) {
+            if (lists[i].positioned() && lists[i].doc_id() == min_did) {
+                s += idx::bm25::score(total_docs, terms[i]->df, lists[i].term_freq(),
+                                      doc_lengths[min_did], avgdl);
+                lists[i].advance();
+            }
+        }
+        push_top_k(top, {min_did, s, 0, {}}, top_k);
     }
 
-    int32_t result = 0;
-    bytes_read = 0; // Reset the byte count for this decoding
-    int shift = 0;  // Shift to combine 7-bit parts of each byte
+    return drain_top_k(top, top_k);
+}
 
-    while (true)
-    {
-        uint8_t byte = data[bytes_read];
-        result |= ((byte & 0x7F) << shift); // Extract the lower 7 bits and shift into place
-        shift += 7;                         // Prepare to add the next 7 bits
+std::vector<idx::SearchResult> SearchEngine::Impl::rank_conjunctive(
+    const std::vector<const LexEntry*>& terms, int top_k) const {
+    if (top_k <= 0) return {};
 
-        bytes_read++; // Move to the next byte
+    std::vector<InvertedList> lists;
+    lists.reserve(terms.size());
+    for (const auto* e : terms) {
+        lists.emplace_back(index_file.data(), e->start_position, e->bytes_size,
+                           e->df, blocks);
+    }
 
-        // If the MSB is 0, it's the last byte of this number, break out of the loop
-        if ((byte & 0x80) == 0)
-        {
-            break;
+    // Position every list on its first posting; if any list is empty there
+    // is no possible intersection.
+    int pivot = 0;
+    for (auto& l : lists) {
+        if (!l.advance()) return {};
+        pivot = std::max(pivot, l.doc_id());
+    }
+
+    TopKHeap top;
+
+    while (true) {
+        bool aligned = true;
+        int max_did = pivot;
+        bool exhausted_any = false;
+        for (auto& l : lists) {
+            if (!l.advanceTo(pivot)) { exhausted_any = true; break; }
+            if (l.doc_id() != pivot) aligned = false;
+            if (l.doc_id() > max_did) max_did = l.doc_id();
+        }
+        if (exhausted_any) break;
+
+        if (aligned) {
+            double s = 0.0;
+            for (std::size_t i = 0; i < lists.size(); ++i) {
+                s += idx::bm25::score(total_docs, terms[i]->df, lists[i].term_freq(),
+                                      doc_lengths[pivot], avgdl);
+            }
+            push_top_k(top, {pivot, s, 0, {}}, top_k);
+            pivot += 1;
+        } else {
+            pivot = max_did;
         }
     }
 
-    return result;
+    return drain_top_k(top, top_k);
 }
 
-int main()
-{
-    SearchEngine engine(LEXICON_FILE,
-                        INDEX_FILE,
-                        DOC_INFO_FILE,
-                        BLOCK_INFO_FILE,
-                        ORIGINAL_TAR_GZ);
-
-    std::string query;
-    bool conjunctive;
-    while (true)
-    {
-        std::cout << "Enter your search query (or 'q' to exit): ";
-        std::getline(std::cin, query);
-        if (query == "q")
-            break;
-
-        std::cout << "Enter search mode (0 for disjunctive, 1 for conjunctive): ";
-        std::cin >> conjunctive;
-        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-
-        auto results = engine.search(query, conjunctive);
-
-        std::cout << "Top 10 results:" << std::endl;
-        for (const auto &result : results)
-        {
-            std::cout << "Doc ID: " << result.doc_id << ", Score: " << result.score << std::endl;
-            // find line position of the original file and print the content
-            // std::string content = engine.getOriginalFileContent(result.doc_id);
-            // std::cout << content << std::endl;
+void SearchEngine::Impl::fill_passages(std::vector<idx::SearchResult>& results) const {
+    if (!collection_stream.is_open()) return;
+    std::lock_guard lk(collection_mutex);
+    for (auto& r : results) {
+        if (r.doc_id < 0 || static_cast<std::size_t>(r.doc_id) >= line_positions.size()) {
+            continue;
+        }
+        collection_stream.clear();
+        collection_stream.seekg(line_positions[r.doc_id]);
+        std::string line;
+        if (std::getline(collection_stream, line)) {
+            const auto tab = line.find('\t');
+            r.passage = (tab == std::string::npos) ? line : line.substr(tab + 1);
+            constexpr std::size_t kMaxLen = 512;
+            if (r.passage.size() > kMaxLen) r.passage.resize(kMaxLen);
         }
     }
-
-    return 0;
 }
+
+std::vector<idx::SearchResult> SearchEngine::Impl::search(std::string_view query,
+                                                          SearchOptions opts) const {
+    if (opts.top_k <= 0) return {};
+
+    auto tokens = tokenize_query(query);
+
+    std::vector<const LexEntry*> term_entries;
+    term_entries.reserve(tokens.size());
+    for (const auto& t : tokens) {
+        const auto it = lexicon.find(t);
+        if (it != lexicon.end()) term_entries.push_back(&it->second);
+    }
+    if (term_entries.empty()) return {};
+
+    auto results = opts.conjunctive
+                       ? rank_conjunctive(term_entries, opts.top_k)
+                       : rank_disjunctive(term_entries, opts.top_k);
+    if (opts.fill_passage) fill_passages(results);
+    return results;
+}
+
+SearchEngine::SearchEngine(const SearchEnginePaths& paths, unsigned threads)
+    : impl_(std::make_unique<Impl>(paths, threads)) {}
+
+SearchEngine::~SearchEngine() = default;
+
+std::vector<idx::SearchResult> SearchEngine::search(std::string_view query,
+                                                    SearchOptions opts) {
+    return impl_->search(query, opts);
+}
+
+std::vector<std::vector<idx::SearchResult>>
+SearchEngine::search_batch(const std::vector<std::string>& queries,
+                           SearchOptions opts) {
+    std::vector<std::vector<idx::SearchResult>> out(queries.size());
+    if (impl_->pool) {
+        std::vector<std::future<void>> futs;
+        futs.reserve(queries.size());
+        std::exception_ptr first_error;
+        try {
+            for (std::size_t i = 0; i < queries.size(); ++i) {
+                futs.push_back(impl_->pool->submit([this, i, &queries, opts, &out] {
+                    out[i] = impl_->search(queries[i], opts);
+                }));
+            }
+        } catch (...) {
+            first_error = std::current_exception();
+        }
+        for (auto& f : futs) {
+            try {
+                f.get();
+            } catch (...) {
+                if (!first_error) first_error = std::current_exception();
+            }
+        }
+        if (first_error) std::rethrow_exception(first_error);
+    } else {
+        for (std::size_t i = 0; i < queries.size(); ++i) {
+            out[i] = impl_->search(queries[i], opts);
+        }
+    }
+    return out;
+}
+
+int SearchEngine::total_docs() const noexcept { return impl_->total_docs; }
+double SearchEngine::avg_doc_length() const noexcept { return impl_->avgdl; }
+
+}  // namespace idx::query
