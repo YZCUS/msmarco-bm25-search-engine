@@ -22,6 +22,21 @@ Posting-store ratio only: VarByte is `0.310x` Raw32 and saves `69.0%`.
 
 ![Compression bar](compression_bar.png)
 
+## Index build memory
+
+Measured with `bash bench/run_memory.sh data/collection.tsv` on the full
+8,841,823-passage collection. Both modes produced byte-identical
+`final_sorted_index.bin`, `final_sorted_block_info.bin`,
+`final_sorted_lexicon.txt`, and `document_info.txt`.
+
+| Builder mode | Partial-index storage | Peak RSS | Build time |
+| ------------ | --------------------- | -------- | ---------- |
+| Vector | decoded `(doc_id, freq)` vectors | 185.08 MB | 204.13 s |
+| Compact | compressed VarByte chunks | 164.81 MB | 59.57 s |
+
+Compact mode reduces peak RSS by `10.95%` and build time by `70.82%` versus
+the Vector baseline in the current streaming-merge implementation.
+
 ## Query latency (P6)
 
 | Threads | QPS | P50 | P95 | P99 |

@@ -4,9 +4,10 @@
 #include "builder.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <fstream>
-#include <queue>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -29,47 +30,116 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// In-memory partial index for a single spill batch.
-//
-// Two storage modes are available, gated by IDX_BUILDER_BASELINE:
-//
-//   default (arena):   std::pmr::vector backed by SlabArena. Inner posting
-//                      lists draw from a single bump pointer that gets reset
-//                      to zero between spill batches in O(1) — ideal for the
-//                      build hot path which churns millions of small
-//                      allocations per batch.
-//
-//   IDX_BUILDER_BASELINE: plain std::vector path used as the "before" arm of
-//                      the memory benchmark. Each inner vector goes through
-//                      the system allocator, exhibiting the reallocation
-//                      churn the arena is meant to eliminate.
-struct PartialIndex {
-#if defined(IDX_BUILDER_BASELINE)
-    using PostingList = std::vector<std::pair<int, int>>;
-    using Postings    = std::vector<PostingList>;
-
+struct TermDictionary {
     std::unordered_map<std::string, int> term_id;
     std::vector<std::string> id_to_term;
-    Postings postings;
+    std::size_t term_string_bytes_estimate = 0;
 
     int touch(const std::string& term) {
         auto it = term_id.find(term);
         if (it != term_id.end()) return it->second;
         const int tid = static_cast<int>(id_to_term.size());
         id_to_term.push_back(term);
-        postings.emplace_back();
-        term_id.emplace(id_to_term.back(), tid);
+        auto [map_it, _] = term_id.emplace(id_to_term.back(), tid);
+        term_string_bytes_estimate += id_to_term.back().capacity() + map_it->first.capacity();
         return tid;
     }
 
     void clear() {
         term_id.clear();
         id_to_term.clear();
+        term_string_bytes_estimate = 0;
+    }
+
+    void release_memory() {
+        std::unordered_map<std::string, int>().swap(term_id);
+        std::vector<std::string>().swap(id_to_term);
+        term_string_bytes_estimate = 0;
+    }
+
+    bool empty() const noexcept { return id_to_term.empty(); }
+    std::size_t size() const noexcept { return id_to_term.size(); }
+    std::string_view term(int tid) const noexcept { return id_to_term[tid]; }
+
+    std::size_t estimated_bytes() const noexcept {
+        return id_to_term.capacity() * sizeof(std::string)
+            + term_string_bytes_estimate
+            + term_id.bucket_count() * sizeof(void*)
+            + term_id.size() * 48;
+    }
+};
+
+// In-memory partial index for a single spill batch.
+//
+// IDX_BUILDER_VECTOR stores decoded (doc_id, freq) pairs and is the memory
+// benchmark baseline. IDX_BUILDER_ARENA keeps that layout but allocates inner
+// vectors from a monotonic resource. IDX_BUILDER_COMPACT stores postings as
+// already-compressed VarByte chunks, which is the memory-plan implementation.
+struct PartialIndex {
+#if defined(IDX_BUILDER_VECTOR)
+    using PostingList = std::vector<std::pair<int, int>>;
+    using Postings    = std::vector<PostingList>;
+
+    TermDictionary terms;
+    Postings postings;
+
+    int touch(const std::string& term) {
+        const int tid = terms.touch(term);
+        if (static_cast<std::size_t>(tid) == postings.size()) postings.emplace_back();
+        return tid;
+    }
+
+    void clear() {
+        terms.clear();
         postings.clear();
     }
 
-    std::size_t arena_bytes_in_use() const noexcept { return 0; }
-#else
+    void release_memory() {
+        terms.release_memory();
+        Postings().swap(postings);
+    }
+
+    bool empty() const noexcept { return terms.empty(); }
+    std::size_t term_count() const noexcept { return terms.size(); }
+    std::string_view term(int tid) const noexcept { return terms.term(tid); }
+    std::size_t posting_count(int tid) const noexcept { return postings[tid].size(); }
+
+    void add(int tid, int doc_id, int freq) {
+        auto& list = postings[tid];
+        if (!list.empty() && list.back().first == doc_id) {
+            list.back().second += freq;
+        } else {
+            list.emplace_back(doc_id, freq);
+        }
+    }
+
+    void write_postings(int tid, std::ostream& out) const {
+        std::vector<std::uint8_t> buf;
+        int prev_did = 0;
+        for (const auto& [did, freq] : postings[tid]) {
+            idx::varbyte::encode(static_cast<std::uint32_t>(did - prev_did), buf);
+            idx::varbyte::encode(static_cast<std::uint32_t>(freq), buf);
+            prev_did = did;
+        }
+        if (!buf.empty()) {
+            out.write(reinterpret_cast<const char*>(buf.data()),
+                      static_cast<std::streamsize>(buf.size()));
+        }
+    }
+
+    std::size_t encoded_bytes() const noexcept {
+        std::size_t n = 0;
+        for (const auto& list : postings) n += list.size() * sizeof(std::pair<int, int>);
+        return n;
+    }
+
+    std::size_t estimated_bytes() const noexcept {
+        return terms.estimated_bytes()
+            + postings.capacity() * sizeof(PostingList)
+            + encoded_bytes()
+            + postings.size() * 16;
+    }
+#elif defined(IDX_BUILDER_ARENA)
     idx::mem::SlabArena arena{ /*slab_bytes=*/8 * 1024 * 1024 };
     idx::mem::SlabResource resource{ &arena };
 
@@ -81,33 +151,173 @@ struct PartialIndex {
     // shows up as a segfault on the second spill batch.
     using Postings = std::vector<PostingList>;
 
-    std::unordered_map<std::string, int> term_id;
-    std::vector<std::string> id_to_term;
+    TermDictionary terms;
     Postings postings;
 
     int touch(const std::string& term) {
-        auto it = term_id.find(term);
-        if (it != term_id.end()) return it->second;
-        const int tid = static_cast<int>(id_to_term.size());
-        id_to_term.push_back(term);
+        const int tid = terms.touch(term);
+        if (static_cast<std::size_t>(tid) != postings.size()) return tid;
         // Explicitly bind the inner vector to the arena resource. We cannot
         // rely on uses-allocator construction here because the outer vector
         // uses the default allocator.
         postings.emplace_back(&resource);
-        term_id.emplace(id_to_term.back(), tid);
         return tid;
     }
 
     void clear() {
-        term_id.clear();
-        id_to_term.clear();
+        terms.clear();
         // Destroy inner vectors first so their destructors run while the
         // arena is still alive, then reclaim the arena in O(1).
         postings.clear();
         arena.reset();
     }
 
-    std::size_t arena_bytes_in_use() const noexcept { return arena.bytes_in_use(); }
+    void release_memory() {
+        clear();
+        Postings().swap(postings);
+    }
+
+    bool empty() const noexcept { return terms.empty(); }
+    std::size_t term_count() const noexcept { return terms.size(); }
+    std::string_view term(int tid) const noexcept { return terms.term(tid); }
+    std::size_t posting_count(int tid) const noexcept { return postings[tid].size(); }
+
+    void add(int tid, int doc_id, int freq) {
+        auto& list = postings[tid];
+        if (!list.empty() && list.back().first == doc_id) {
+            list.back().second += freq;
+        } else {
+            list.emplace_back(doc_id, freq);
+        }
+    }
+
+    void write_postings(int tid, std::ostream& out) const {
+        std::vector<std::uint8_t> buf;
+        int prev_did = 0;
+        for (const auto& [did, freq] : postings[tid]) {
+            idx::varbyte::encode(static_cast<std::uint32_t>(did - prev_did), buf);
+            idx::varbyte::encode(static_cast<std::uint32_t>(freq), buf);
+            prev_did = did;
+        }
+        if (!buf.empty()) {
+            out.write(reinterpret_cast<const char*>(buf.data()),
+                      static_cast<std::streamsize>(buf.size()));
+        }
+    }
+
+    std::size_t encoded_bytes() const noexcept {
+        std::size_t n = 0;
+        for (const auto& list : postings) n += list.size() * sizeof(std::pair<int, int>);
+        return n;
+    }
+
+    std::size_t estimated_bytes() const noexcept {
+        return terms.estimated_bytes()
+            + postings.capacity() * sizeof(PostingList)
+            + arena.bytes_in_use()
+            + postings.size() * 16;
+    }
+#else
+    static constexpr std::uint32_t kNoChunk = std::numeric_limits<std::uint32_t>::max();
+    static constexpr std::size_t kChunkBytes = 64;
+
+    struct TermState {
+        int last_doc_id = 0;
+        std::uint32_t df = 0;
+        std::uint32_t first_chunk = kNoChunk;
+        std::uint32_t last_chunk = kNoChunk;
+        std::size_t byte_count = 0;
+    };
+
+    struct Chunk {
+        std::uint32_t next = kNoChunk;
+        std::uint8_t size = 0;
+        std::array<std::uint8_t, kChunkBytes> data{};
+    };
+
+    TermDictionary terms;
+    std::vector<TermState> states;
+    std::vector<Chunk> chunks;
+
+    int touch(const std::string& term) {
+        const int tid = terms.touch(term);
+        if (static_cast<std::size_t>(tid) == states.size()) states.emplace_back();
+        return tid;
+    }
+
+    void clear() {
+        terms.clear();
+        states.clear();
+        chunks.clear();
+    }
+
+    void release_memory() {
+        terms.release_memory();
+        std::vector<TermState>().swap(states);
+        std::vector<Chunk>().swap(chunks);
+    }
+
+    bool empty() const noexcept { return terms.empty(); }
+    std::size_t term_count() const noexcept { return terms.size(); }
+    std::string_view term(int tid) const noexcept { return terms.term(tid); }
+    std::size_t posting_count(int tid) const noexcept { return states[tid].df; }
+
+    void add(int tid, int doc_id, int freq) {
+        auto& st = states[tid];
+        if (st.df > 0 && doc_id <= st.last_doc_id) {
+            throw std::runtime_error("compact builder: doc_ids must increase per term");
+        }
+        append_varbyte(st, static_cast<std::uint32_t>(doc_id - st.last_doc_id));
+        append_varbyte(st, static_cast<std::uint32_t>(freq));
+        st.last_doc_id = doc_id;
+        ++st.df;
+    }
+
+    void write_postings(int tid, std::ostream& out) const {
+        for (std::uint32_t c = states[tid].first_chunk; c != kNoChunk; c = chunks[c].next) {
+            const auto& chunk = chunks[c];
+            out.write(reinterpret_cast<const char*>(chunk.data.data()), chunk.size);
+        }
+    }
+
+    std::size_t encoded_bytes() const noexcept {
+        std::size_t n = 0;
+        for (const auto& st : states) n += st.byte_count;
+        return n;
+    }
+
+    std::size_t estimated_bytes() const noexcept {
+        return terms.estimated_bytes()
+            + states.capacity() * sizeof(TermState)
+            + chunks.capacity() * sizeof(Chunk)
+            + states.size() * 8;
+    }
+
+private:
+    void append_varbyte(TermState& st, std::uint32_t v) {
+        while (v >= 0x80u) {
+            append_byte(st, static_cast<std::uint8_t>(v | 0x80u));
+            v >>= 7;
+        }
+        append_byte(st, static_cast<std::uint8_t>(v));
+    }
+
+    void append_byte(TermState& st, std::uint8_t byte) {
+        if (st.last_chunk == kNoChunk || chunks[st.last_chunk].size == kChunkBytes) {
+            const auto idx = static_cast<std::uint32_t>(chunks.size());
+            chunks.emplace_back();
+            if (st.first_chunk == kNoChunk) {
+                st.first_chunk = idx;
+            } else {
+                chunks[st.last_chunk].next = idx;
+            }
+            st.last_chunk = idx;
+        }
+        auto& chunk = chunks[st.last_chunk];
+        chunk.data[chunk.size] = byte;
+        ++chunk.size;
+        ++st.byte_count;
+    }
 #endif
 };
 
@@ -115,12 +325,7 @@ struct PartialIndex {
 // document was just appended.
 void add_posting(PartialIndex& idx, const std::string& term, int doc_id, int freq) {
     const int tid = idx.touch(term);
-    auto& list = idx.postings[tid];
-    if (!list.empty() && list.back().first == doc_id) {
-        list.back().second += freq;
-    } else {
-        list.emplace_back(doc_id, freq);
-    }
+    idx.add(tid, doc_id, freq);
 }
 
 // Spill format (lexicographically sorted by term):
@@ -128,19 +333,19 @@ void add_posting(PartialIndex& idx, const std::string& term, int doc_id, int fre
 //   <num_postings:vbyte>
 //   for each posting: <doc_id_delta:vbyte> <freq:vbyte>
 void spill_partial(const PartialIndex& idx, const fs::path& path) {
-    std::vector<int> tids(idx.id_to_term.size());
+    std::vector<int> tids(idx.term_count());
     for (std::size_t i = 0; i < tids.size(); ++i) tids[i] = static_cast<int>(i);
     std::sort(tids.begin(), tids.end(),
-              [&](int a, int b) { return idx.id_to_term[a] < idx.id_to_term[b]; });
+              [&](int a, int b) { return idx.term(a) < idx.term(b); });
 
     std::ofstream out(path, std::ios::binary);
     if (!out) throw std::runtime_error("spill: cannot open " + path.string());
 
     std::vector<std::uint8_t> buf;
     for (int tid : tids) {
-        const auto& term = idx.id_to_term[tid];
-        const auto& postings = idx.postings[tid];
-        if (postings.empty()) continue;
+        const auto& term = idx.term(tid);
+        const auto postings = idx.posting_count(tid);
+        if (postings == 0) continue;
 
         buf.clear();
         idx::varbyte::encode(static_cast<std::uint32_t>(term.size()), buf);
@@ -149,16 +354,10 @@ void spill_partial(const PartialIndex& idx, const fs::path& path) {
         out.write(term.data(), static_cast<std::streamsize>(term.size()));
 
         buf.clear();
-        idx::varbyte::encode(static_cast<std::uint32_t>(postings.size()), buf);
-        int prev_did = 0;
-        for (std::size_t i = 0; i < postings.size(); ++i) {
-            const int delta = postings[i].first - prev_did;
-            idx::varbyte::encode(static_cast<std::uint32_t>(delta), buf);
-            idx::varbyte::encode(static_cast<std::uint32_t>(postings[i].second), buf);
-            prev_did = postings[i].first;
-        }
+        idx::varbyte::encode(static_cast<std::uint32_t>(postings), buf);
         out.write(reinterpret_cast<const char*>(buf.data()),
                   static_cast<std::streamsize>(buf.size()));
+        idx.write_postings(tid, out);
     }
 }
 
@@ -218,60 +417,55 @@ public:
         if (!lex_out_)   throw std::runtime_error("FinalWriter: open final_sorted_lexicon.txt");
     }
 
-    void write_term(const std::string& term, std::vector<std::pair<int, int>> postings) {
-        if (postings.empty()) return;
-        std::sort(postings.begin(), postings.end(),
-                  [](const auto& a, const auto& b) { return a.first < b.first; });
-        // Coalesce duplicate doc_ids that may show up across spill files.
-        std::vector<std::pair<int, int>> merged;
-        merged.reserve(postings.size());
-        for (const auto& p : postings) {
-            if (!merged.empty() && merged.back().first == p.first) {
-                merged.back().second += p.second;
-            } else {
-                merged.push_back(p);
+    void begin_term(const std::string& term) {
+        if (term_open_) throw std::runtime_error("FinalWriter: term already open");
+        current_term_ = term;
+        term_start_ = cur_offset_;
+        doc_buf_.clear();
+        freq_buf_.clear();
+        prev_did_ = 0;
+        last_did_ = 0;
+        in_block_ = 0;
+        current_df_ = 0;
+        have_pending_ = false;
+        pending_did_ = 0;
+        pending_freq_ = 0;
+        term_open_ = true;
+    }
+
+    void add_posting(int did, int freq) {
+        if (!term_open_) throw std::runtime_error("FinalWriter: no term open");
+        if (have_pending_) {
+            if (did < pending_did_) {
+                throw std::runtime_error("FinalWriter: postings must be sorted by doc_id");
             }
+            if (did == pending_did_) {
+                pending_freq_ += freq;
+                return;
+            }
+            flush_pending();
+        }
+        pending_did_ = did;
+        pending_freq_ = freq;
+        have_pending_ = true;
+    }
+
+    void finish_term() {
+        if (!term_open_) return;
+        flush_pending();
+        flush_block();
+        if (current_df_ == 0) {
+            current_term_.clear();
+            term_open_ = false;
+            return;
         }
 
-        const std::int64_t term_start = cur_offset_;
-        std::vector<std::uint8_t> doc_buf, freq_buf;
-        int prev_did = 0;
-        int last_did = 0;
-        int in_block = 0;
-
-        auto flush = [&] {
-            if (in_block == 0) return;
-            index_out_.write(reinterpret_cast<const char*>(doc_buf.data()),
-                             static_cast<std::streamsize>(doc_buf.size()));
-            index_out_.write(reinterpret_cast<const char*>(freq_buf.data()),
-                             static_cast<std::streamsize>(freq_buf.size()));
-            const std::int32_t last_did_v = static_cast<std::int32_t>(last_did);
-            const std::int64_t did_size  = static_cast<std::int64_t>(doc_buf.size());
-            const std::int64_t freq_size = static_cast<std::int64_t>(freq_buf.size());
-            blocks_out_.write(reinterpret_cast<const char*>(&last_did_v), sizeof(last_did_v));
-            blocks_out_.write(reinterpret_cast<const char*>(&did_size),    sizeof(did_size));
-            blocks_out_.write(reinterpret_cast<const char*>(&freq_size),   sizeof(freq_size));
-            cur_offset_ += did_size + freq_size;
-            doc_buf.clear();
-            freq_buf.clear();
-            in_block = 0;
-        };
-
-        for (const auto& [did, f] : merged) {
-            const int delta = did - prev_did;
-            idx::codec::encode(static_cast<std::uint32_t>(delta), doc_buf);
-            idx::codec::encode(static_cast<std::uint32_t>(f), freq_buf);
-            prev_did = did;
-            last_did = did;
-            ++in_block;
-            if (in_block == postings_per_block_) flush();
-        }
-        flush();
-
-        const std::int64_t bytes_size = cur_offset_ - term_start;
-        lex_out_ << term << ' ' << term_id_counter_ << ' ' << merged.size()
-                 << ' ' << term_start << ' ' << bytes_size << '\n';
+        const std::int64_t bytes_size = cur_offset_ - term_start_;
+        lex_out_ << current_term_ << ' ' << term_id_counter_ << ' ' << current_df_
+                 << ' ' << term_start_ << ' ' << bytes_size << '\n';
         ++term_id_counter_;
+        current_term_.clear();
+        term_open_ = false;
     }
 
     int term_count() const noexcept { return term_id_counter_; }
@@ -284,7 +478,65 @@ private:
     std::int64_t cur_offset_ = 0;
     int term_id_counter_ = 0;
     int postings_per_block_;
+    std::string current_term_;
+    std::int64_t term_start_ = 0;
+    std::vector<std::uint8_t> doc_buf_;
+    std::vector<std::uint8_t> freq_buf_;
+    int prev_did_ = 0;
+    int last_did_ = 0;
+    int in_block_ = 0;
+    std::size_t current_df_ = 0;
+    bool term_open_ = false;
+    bool have_pending_ = false;
+    int pending_did_ = 0;
+    int pending_freq_ = 0;
+
+    void flush_pending() {
+        if (!have_pending_) return;
+        const int delta = pending_did_ - prev_did_;
+        idx::codec::encode(static_cast<std::uint32_t>(delta), doc_buf_);
+        idx::codec::encode(static_cast<std::uint32_t>(pending_freq_), freq_buf_);
+        prev_did_ = pending_did_;
+        last_did_ = pending_did_;
+        ++in_block_;
+        ++current_df_;
+        have_pending_ = false;
+        if (in_block_ == postings_per_block_) flush_block();
+    }
+
+    void flush_block() {
+        if (in_block_ == 0) return;
+        index_out_.write(reinterpret_cast<const char*>(doc_buf_.data()),
+                         static_cast<std::streamsize>(doc_buf_.size()));
+        index_out_.write(reinterpret_cast<const char*>(freq_buf_.data()),
+                         static_cast<std::streamsize>(freq_buf_.size()));
+        const std::int32_t last_did_v = static_cast<std::int32_t>(last_did_);
+        const std::int64_t did_size = static_cast<std::int64_t>(doc_buf_.size());
+        const std::int64_t freq_size = static_cast<std::int64_t>(freq_buf_.size());
+        blocks_out_.write(reinterpret_cast<const char*>(&last_did_v), sizeof(last_did_v));
+        blocks_out_.write(reinterpret_cast<const char*>(&did_size), sizeof(did_size));
+        blocks_out_.write(reinterpret_cast<const char*>(&freq_size), sizeof(freq_size));
+        cur_offset_ += did_size + freq_size;
+        doc_buf_.clear();
+        freq_buf_.clear();
+        in_block_ = 0;
+    }
 };
+
+void write_stats_json(const fs::path& path, const BuildStats& stats) {
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("write_stats_json: cannot open " + path.string());
+    out << "{\n"
+        << "  \"docs_processed\": " << stats.docs_processed << ",\n"
+        << "  \"total_postings\": " << stats.total_postings << ",\n"
+        << "  \"spill_count\": " << stats.spill_count << ",\n"
+        << "  \"peak_unique_terms\": " << stats.peak_unique_terms << ",\n"
+        << "  \"peak_partial_postings\": " << stats.peak_partial_postings << ",\n"
+        << "  \"peak_partial_bytes_estimate\": " << stats.peak_partial_bytes_estimate << ",\n"
+        << "  \"final_terms\": " << stats.final_terms << ",\n"
+        << "  \"final_index_bytes\": " << stats.final_index_bytes << "\n"
+        << "}\n";
+}
 
 }  // namespace
 
@@ -302,6 +554,14 @@ void build_index(const fs::path& input_tsv, const fs::path& output_dir,
 
     PartialIndex partial;
     std::size_t partial_postings = 0;
+    BuildStats stats;
+
+    auto update_peak = [&] {
+        stats.peak_unique_terms = std::max(stats.peak_unique_terms, partial.term_count());
+        stats.peak_partial_postings = std::max(stats.peak_partial_postings, partial_postings);
+        stats.peak_partial_bytes_estimate =
+            std::max(stats.peak_partial_bytes_estimate, partial.estimated_bytes());
+    };
 
     std::string line;
     line.reserve(2048);
@@ -331,7 +591,9 @@ void build_index(const fs::path& input_tsv, const fs::path& output_dir,
         for (const auto& [t, f] : per_doc) {
             add_posting(partial, t, doc_id_counter, f);
             ++partial_postings;
+            ++stats.total_postings;
         }
+        update_peak();
 
         doc_info_out << doc_length << ' ' << this_line_pos << '\n';
 
@@ -339,6 +601,7 @@ void build_index(const fs::path& input_tsv, const fs::path& output_dir,
             const fs::path temp_path = temp_prefix + std::to_string(temp_files.size()) + ".bin";
             spill_partial(partial, temp_path);
             temp_files.push_back(temp_path);
+            ++stats.spill_count;
             partial.clear();
             partial_postings = 0;
             IDX_LOG("spilled batch " << temp_files.size() << " at doc " << doc_id_counter);
@@ -346,12 +609,15 @@ void build_index(const fs::path& input_tsv, const fs::path& output_dir,
         ++doc_id_counter;
     }
 
-    if (!partial.id_to_term.empty()) {
+    if (!partial.empty()) {
         const fs::path temp_path = temp_prefix + std::to_string(temp_files.size()) + ".bin";
         spill_partial(partial, temp_path);
         temp_files.push_back(temp_path);
+        ++stats.spill_count;
         partial.clear();
     }
+    partial.release_memory();
+    stats.docs_processed = static_cast<std::size_t>(doc_id_counter);
     doc_info_out.close();
 
     IDX_LOG("merging " << temp_files.size() << " spills");
@@ -364,34 +630,51 @@ void build_index(const fs::path& input_tsv, const fs::path& output_dir,
         if (!files.back()) throw std::runtime_error("merge: cannot open " + p.string());
     }
 
-    auto cmp = [](const SpillEntry& a, const SpillEntry& b) { return a.term > b.term; };
-    std::priority_queue<SpillEntry, std::vector<SpillEntry>, decltype(cmp)> pq(cmp);
+    auto cmp = [](const SpillEntry& a, const SpillEntry& b) {
+        if (a.term != b.term) return a.term > b.term;
+        return a.file_index > b.file_index;
+    };
+    std::vector<SpillEntry> heap;
+    heap.reserve(files.size());
+    auto push_entry = [&](SpillEntry entry) {
+        heap.push_back(std::move(entry));
+        std::push_heap(heap.begin(), heap.end(), cmp);
+    };
+    auto pop_entry = [&] {
+        std::pop_heap(heap.begin(), heap.end(), cmp);
+        SpillEntry entry = std::move(heap.back());
+        heap.pop_back();
+        return entry;
+    };
     for (int i = 0; i < static_cast<int>(files.size()); ++i) {
         SpillEntry e;
-        if (read_spill_entry(files[i], e, i)) pq.push(std::move(e));
+        if (read_spill_entry(files[i], e, i)) push_entry(std::move(e));
     }
 
     FinalWriter writer(output_dir, opts.postings_per_block);
-    while (!pq.empty()) {
-        const std::string term = pq.top().term;
-        std::vector<std::pair<int, int>> merged;
-        while (!pq.empty() && pq.top().term == term) {
-            SpillEntry e = pq.top();
-            pq.pop();
-            for (const auto& p : e.postings) merged.push_back(p);
+    while (!heap.empty()) {
+        const std::string term = heap.front().term;
+        writer.begin_term(term);
+        while (!heap.empty() && heap.front().term == term) {
+            SpillEntry e = pop_entry();
+            for (const auto& p : e.postings) writer.add_posting(p.first, p.second);
             const int idx_in_files = e.file_index;
             SpillEntry next_entry;
             if (read_spill_entry(files[idx_in_files], next_entry, idx_in_files)) {
-                pq.push(std::move(next_entry));
+                push_entry(std::move(next_entry));
             }
         }
-        writer.write_term(term, std::move(merged));
+        writer.finish_term();
     }
 
     for (const auto& p : temp_files) {
         std::error_code ec;
         fs::remove(p, ec);
     }
+    stats.final_terms = static_cast<std::size_t>(writer.term_count());
+    stats.final_index_bytes = static_cast<std::size_t>(writer.total_bytes());
+    if (opts.stats) *opts.stats = stats;
+    if (!opts.stats_json_path.empty()) write_stats_json(opts.stats_json_path, stats);
     IDX_LOG("done. terms=" << writer.term_count() << " bytes=" << writer.total_bytes());
 }
 

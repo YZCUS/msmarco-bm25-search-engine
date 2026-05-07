@@ -36,9 +36,14 @@ class ExtractRssTest(unittest.TestCase):
 
     def test_render_markdown_reports_reduction(self) -> None:
         md = extract_rss.render_markdown(1000, 750)
-        self.assertIn("Default allocator", md)
-        self.assertIn("SlabArena", md)
+        self.assertIn("Vector partial index", md)
+        self.assertIn("Compact partial index", md)
         self.assertIn("25.0%", md)
+
+    def test_render_json_reports_reduction(self) -> None:
+        text = extract_rss.render_json(1000, 750)
+        self.assertIn('"reduction_percent": 25.0', text)
+        self.assertIn("Compact partial index", text)
 
 
 class PlotLatencyTest(unittest.TestCase):

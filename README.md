@@ -2,8 +2,8 @@
 
 > Built an inverted index over 8.8M MS MARCO passages with BM25 ranking and
 > parallel query execution. VarByte compression cuts posting-store bytes by
-> 69.0%, with benchmark and TREC-style evaluation artifacts checked into
-> `docs/`.
+> 69.0%; the compact builder peaks at 164.81 MB RSS on the full corpus, with
+> benchmark and TREC-style evaluation artifacts checked into `docs/`.
 
 > Full benchmark tables and charts are in
 > [docs/benchmark_results.md](docs/benchmark_results.md). The test suite is
@@ -16,6 +16,7 @@
 | Documents indexed                 | 8,841,823       |
 | Index size (VarByte)              | 1.00 GB total   |
 | Compression vs. Raw32             | 69.0% posting-store reduction |
+| Compact build peak RSS / time     | 164.81 MB / 59.57 s |
 | Query latency P50 / P95 / P99     | 2.16 / 6.35 / 8.85 ms at 8 threads |
 | QPS @ 8 threads                   | 385.4           |
 | MRR@10 (MS MARCO dev)             | 0.1812          |
@@ -56,7 +57,10 @@ done
 # 6. Ranking metrics.
 bash scripts/eval_all.sh data/index_varbyte
 
-# 7. Try the RAG demo (requires Ollama or OPENAI_API_KEY).
+# 7. Builder memory benchmark (Vector vs Compact partial index).
+bash bench/run_memory.sh data/collection.tsv
+
+# 8. Try the RAG demo (requires Ollama or OPENAI_API_KEY).
 python -m rag_demo.rag_demo --q "what is bm25" \
     --search-cli ./build/search_cli \
     --index data/index_varbyte/final_sorted_index.bin \
@@ -104,6 +108,8 @@ scripts/    helper scripts (build_two_indexes, eval_all, plotters)
 
 - **VarByte vs Raw32 ablation** - same logical postings, different codec, gives
   a clean apples-to-apples compression number.
+- **Memory-bounded index construction** - compact VarByte spill buffers and a
+  streaming final merge keep full-corpus build RSS under 165 MB.
 - **DAAT BM25 + block-skipping** - block-level metadata supports efficient
   conjunctive queries; MaxScore / WAND remain beyond the current scope.
 - **TREC eval pipeline** - produces the same run-file format used by Anserini /

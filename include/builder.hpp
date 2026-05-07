@@ -17,6 +17,17 @@
 
 namespace idx::build {
 
+struct BuildStats {
+    std::size_t docs_processed = 0;
+    std::size_t total_postings = 0;
+    std::size_t spill_count = 0;
+    std::size_t peak_unique_terms = 0;
+    std::size_t peak_partial_postings = 0;
+    std::size_t peak_partial_bytes_estimate = 0;
+    std::size_t final_terms = 0;
+    std::size_t final_index_bytes = 0;
+};
+
 struct BuildOptions {
     // Approximate number of postings to accumulate in memory before spilling.
     // Each Posting is ~16 bytes including hash-map overhead, so 4M postings
@@ -26,6 +37,13 @@ struct BuildOptions {
     // Maximum postings packed into a single block on disk. Must match what
     // the search-time block iterator expects.
     int postings_per_block = 128;
+
+    // Optional JSON output for build-time stats. Intended for local benchmark
+    // runs; generated files should stay under bench_results/.
+    std::filesystem::path stats_json_path;
+
+    // Optional in-process stats sink used by tests and embedding callers.
+    BuildStats* stats = nullptr;
 };
 
 void build_index(const std::filesystem::path& input_tsv,

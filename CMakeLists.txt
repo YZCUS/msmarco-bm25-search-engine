@@ -30,10 +30,11 @@ if(IDX_ASAN)
     add_link_options(-fsanitize=address,undefined)
 endif()
 
-# Build the index using the legacy (default-allocator) PartialIndex storage,
-# rather than the SlabArena + std::pmr path. Used as the "before" arm of the
-# memory benchmark.
-option(IDX_BUILDER_BASELINE "Use default allocator instead of SlabArena in builder" OFF)
+# Build-time partial-index storage. Compact is the portfolio path; Vector is
+# the baseline used by memory benchmarks; Arena is kept for local experiments.
+set(IDX_BUILDER_MODE "Compact" CACHE STRING "Builder storage: Compact | Vector | Arena")
+set_property(CACHE IDX_BUILDER_MODE PROPERTY STRINGS Compact Vector Arena)
+option(IDX_BUILDER_BASELINE "Compatibility: use Vector builder mode" OFF)
 
 find_package(Threads REQUIRED)
 
@@ -49,7 +50,15 @@ set(IDX_CODEC_DEFINE "IDX_CODEC_${IDX_CODEC}")
 add_library(builder STATIC src/builder.cpp)
 target_compile_definitions(builder PUBLIC ${IDX_CODEC_DEFINE})
 if(IDX_BUILDER_BASELINE)
-    target_compile_definitions(builder PRIVATE IDX_BUILDER_BASELINE)
+    target_compile_definitions(builder PRIVATE IDX_BUILDER_VECTOR)
+elseif(IDX_BUILDER_MODE STREQUAL "Vector")
+    target_compile_definitions(builder PRIVATE IDX_BUILDER_VECTOR)
+elseif(IDX_BUILDER_MODE STREQUAL "Arena")
+    target_compile_definitions(builder PRIVATE IDX_BUILDER_ARENA)
+elseif(IDX_BUILDER_MODE STREQUAL "Compact")
+    target_compile_definitions(builder PRIVATE IDX_BUILDER_COMPACT)
+else()
+    message(FATAL_ERROR "IDX_BUILDER_MODE must be Compact, Vector, or Arena")
 endif()
 
 add_executable(build_index src/build_index.cpp)

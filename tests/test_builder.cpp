@@ -7,6 +7,7 @@
 #include <fstream>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -111,10 +112,42 @@ void test_passage_retrieval_when_collection_provided() {
     fs::remove_all(dir);
 }
 
+void test_build_stats_reports_doc_term_postings() {
+    auto dir = make_temp_dir();
+    const auto coll = dir / "collection.tsv";
+    const auto stats_path = dir / "stats.json";
+    write_tiny_collection(coll);
+
+    idx::build::BuildStats stats;
+    idx::build::BuildOptions opts;
+    opts.spill_threshold = 3;
+    opts.postings_per_block = 2;
+    opts.stats = &stats;
+    opts.stats_json_path = stats_path;
+    idx::build::build_index(coll, dir, opts);
+
+    IDX_CHECK_EQ(stats.docs_processed, 5u);
+    IDX_CHECK_EQ(stats.total_postings, 8u);
+    IDX_CHECK_EQ(stats.final_terms, 4u);
+    IDX_CHECK(stats.spill_count >= 2u);
+    IDX_CHECK(stats.peak_unique_terms >= 3u);
+    IDX_CHECK(stats.peak_partial_bytes_estimate > 0u);
+
+    std::ifstream in(stats_path);
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    const auto json = buffer.str();
+    IDX_CHECK(json.find("\"docs_processed\": 5") != std::string::npos);
+    IDX_CHECK(json.find("\"total_postings\": 8") != std::string::npos);
+
+    fs::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
     test_build_then_search_roundtrip();
     test_passage_retrieval_when_collection_provided();
+    test_build_stats_reports_doc_term_postings();
     return idx::testing::report("test_builder");
 }

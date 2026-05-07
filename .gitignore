@@ -3,6 +3,12 @@ data/
 src/collection.tar.gz
 collection.tar.gz
 
+# Local-only planning and agent instructions. Keep these on the machine, but
+# do not publish them to the portfolio repository.
+/IMPLEMENTATION.md
+/AGENTS.md
+/CLAUDE.md
+
 # Build directories
 /build/
 /build-*/
