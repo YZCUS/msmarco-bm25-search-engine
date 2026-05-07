@@ -5,12 +5,9 @@
 > 69.0%, with benchmark and TREC-style evaluation artifacts checked into
 > `docs/`.
 
-> Implementation status: P0-P10 benchmark/docs artifacts complete on real
-> MS MARCO data, with CTest green under both `IDX_CODEC=VarByte` and
-> `IDX_CODEC=Raw32`. No release tag has been cut yet. Full tables:
-> [docs/benchmark_results.md](docs/benchmark_results.md). Phase plan / runbook:
-> [IMPLEMENTATION.md](IMPLEMENTATION.md). **Repo layout + presentation:**
-> [docs/renovation_presentation_plan.md](docs/renovation_presentation_plan.md).
+> Full benchmark tables and charts are in
+> [docs/benchmark_results.md](docs/benchmark_results.md). The test suite is
+> green under both `IDX_CODEC=VarByte` and `IDX_CODEC=Raw32`.
 
 ## At a Glance
 
@@ -75,7 +72,7 @@ python -m rag_demo.rag_demo --q "what is bm25" \
 flowchart LR
     subgraph Build [Build Pipeline]
         TarGz["MS MARCO collection.tsv"] --> Tokenizer
-        Tokenizer --> InMem["In-memory partial index<br/>(SlabArena)"]
+        Tokenizer --> InMem["In-memory partial index"]
         InMem --> Spill["Spill to temp_index_*.bin<br/>(VarByte)"]
         Spill --> Merge["External k-way merge"]
         Merge --> Final["final_sorted_index.bin<br/>+ block_info<br/>+ lexicon"]
@@ -93,7 +90,7 @@ flowchart LR
 ## Layout
 
 ```
-include/    public headers (varbyte / bm25 / allocator / thread_pool / ...)
+include/    public headers (varbyte / bm25 / codec / thread_pool / ...)
 src/        executable sources (build_index / search / search_cli)
 bench/      latency, compression, index size, memory benchmarks
 eval/       MS MARCO download + TREC run writer + pytrec_eval driver
@@ -115,8 +112,8 @@ scripts/    helper scripts (build_two_indexes, eval_all, plotters)
 ## Known Limitations
 
 - ASCII-only tokenizer; no stemming; stop-word filtering is query-time only.
-- Block-Max WAND, MaxScore early termination, and SIMD-BP128 are not part of
-  the completed implementation plan.
+- Block-Max WAND, MaxScore early termination, and SIMD-BP128 are outside the
+  current scope.
 - Single-machine; no sharding / distributed merge.
 
 ## License
