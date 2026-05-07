@@ -1,4 +1,4 @@
-# RAG-Ready Search Engine Indexer
+# MS MARCO BM25 Search Engine
 
 > Built an inverted index over 8.8M MS MARCO passages with BM25 ranking and
 > parallel query execution. VarByte compression cuts posting-store bytes by
@@ -113,16 +113,16 @@ scripts/    helper scripts (build_two_indexes, eval_all, plotters)
   a clean apples-to-apples compression number.
 - **SlabArena allocator** — monotonic slab + std::pmr path is implemented and
   benchmarked; current peak RSS was slightly worse than the default allocator.
-- **DAAT BM25 + block-skipping** — block-level metadata enables fast
-  conjunctive queries; MaxScore / WAND are tracked under future work.
+- **DAAT BM25 + block-skipping** — block-level metadata supports efficient
+  conjunctive queries; MaxScore / WAND remain beyond the current scope.
 - **TREC eval pipeline** — produces the same run-file format used by Anserini /
   Pyserini, so results are directly comparable to published baselines.
 
-## Limitations & Future Work
+## Known Limitations
 
-- ASCII-only tokenizer; no stemming, no stop-word removal.
-- Block-Max WAND, MaxScore early termination, SIMD-BP128 codec are listed but
-  not implemented.
+- ASCII-only tokenizer; no stemming; stop-word filtering is query-time only.
+- Block-Max WAND, MaxScore early termination, and SIMD-BP128 are not part of
+  the completed implementation plan.
 - Single-machine; no sharding / distributed merge.
 
 ## License

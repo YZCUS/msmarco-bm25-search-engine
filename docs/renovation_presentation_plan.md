@@ -1,4 +1,4 @@
-# RAG-Ready Search Engine Indexer — 改造與呈現計劃
+# MS MARCO BM25 Search Engine — 改造與呈現計劃
 
 本文件對齊 Cursor 對話初期的「總計劃」：**目錄與元件如何分工**、對外要如何呈現。
 
@@ -13,7 +13,7 @@
 以下為刻意設計的 **source-layout**；不包含本機才有的 `build/`、`build-*`、大型資料檔、`__pycache__` 等。
 
 ```text
-build_inverted_index/
+msmarco-bm25-search-engine/
 ├── .github/
 │   └── workflows/          # CI（VarByte / Raw32 matrix 等）
 ├── bench/                  # C++ benchmarks：latency, index size, compression

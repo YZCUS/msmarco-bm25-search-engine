@@ -1,6 +1,6 @@
 {
-  "qrels": "/Users/zhengchy/documents/projects/build_inverted_index/data/2020qrels-pass.txt",
-  "run": "/Users/zhengchy/documents/projects/build_inverted_index/runs/dl20.run",
+  "qrels": "data/2020qrels-pass.txt",
+  "run": "runs/dl20.run",
   "metrics": {
     "map": 0.31877414794345277,
     "recip_rank": 0.7963734567901235,

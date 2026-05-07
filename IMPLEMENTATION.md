@@ -1,4 +1,4 @@
-# RAG-Ready Search Engine Indexer — 實作 Runbook
+# MS MARCO BM25 Search Engine — 實作 Runbook
 
 > 本文件對應 `.cursor/plans/rag-ready_bm25_indexer_*.plan.md` 的詳細落地版本。
 > **Repository 目錄樹與對外呈現摘要**（總覽用）另見
@@ -718,7 +718,7 @@ jobs:
 #### 10.1 README.md 結構
 
 ```markdown
-# RAG-Ready Search Engine Indexer
+# MS MARCO BM25 Search Engine
 
 > Built an inverted index over 8.8M MS MARCO passages with BM25 ranking and
 > parallel query execution. VarByte compression cut posting size by __%,
@@ -753,7 +753,7 @@ jobs:
 - DAAT BM25 with parallel batch
 - TREC eval pipeline
 
-## Limitations & Future Work
+## Known Limitations
 ```
 
 #### 10.2 `docs/benchmark_results.md`
@@ -771,7 +771,7 @@ jobs:
 
 #### 10.4 履歷連結
 
-把 GitHub repo URL 放在履歷 *RAG-Ready Search Engine Indexer* 條目下方；面試官點進來首屏即看到三條 bullet 對應的證據。
+把 GitHub repo URL 放在履歷 *MS MARCO BM25 Search Engine* 條目下方；面試官點進來首屏即看到三條 bullet 對應的證據。
 
 ### 注意事項
 - README 不要寫超過 250 行；想寫長放 `docs/`。
@@ -1002,7 +1002,7 @@ while (true) {
 
 更激進：在每個 block 紀錄 block-local `max_freq` 與 `min_doc_length`，可推 block-local 上界。query 時若 pivot block 的上界 < threshold，整 block skip。
 
-本專案先實作 C.2 + C.3；MaxScore 與 BMW 列在 README "Future Work" 即可。
+本專案先實作 C.2 + C.3；MaxScore 與 BMW 列在 README 的 scope 外限制即可。
 
 ---
 

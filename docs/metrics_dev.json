@@ -1,6 +1,6 @@
 {
-  "qrels": "/Users/zhengchy/documents/projects/build_inverted_index/data/qrels.dev.small.tsv",
-  "run": "/Users/zhengchy/documents/projects/build_inverted_index/runs/dev.run",
+  "qrels": "data/qrels.dev.small.tsv",
+  "run": "runs/dev.run",
   "metrics": {
     "map": 0.18926147074394692,
     "recip_rank": 0.19238245389574607,
