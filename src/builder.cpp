@@ -30,6 +30,20 @@ namespace fs = std::filesystem;
 
 namespace {
 
+int checked_int(std::size_t value, const char* context) {
+    if (value > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::overflow_error(std::string(context) + ": exceeds int range");
+    }
+    return static_cast<int>(value);
+}
+
+std::uint32_t checked_u32(std::size_t value, const char* context) {
+    if (value > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+        throw std::overflow_error(std::string(context) + ": exceeds uint32 range");
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
 struct TermDictionary {
     std::unordered_map<std::string, int> term_id;
     std::vector<std::string> id_to_term;
@@ -38,7 +52,7 @@ struct TermDictionary {
     int touch(const std::string& term) {
         auto it = term_id.find(term);
         if (it != term_id.end()) return it->second;
-        const int tid = static_cast<int>(id_to_term.size());
+        const int tid = checked_int(id_to_term.size(), "term id");
         id_to_term.push_back(term);
         auto [map_it, _] = term_id.emplace(id_to_term.back(), tid);
         term_string_bytes_estimate += id_to_term.back().capacity() + map_it->first.capacity();
@@ -173,7 +187,9 @@ struct PartialIndex {
     }
 
     void release_memory() {
-        clear();
+        terms.release_memory();
+        postings.clear();
+        arena.reset();
         Postings().swap(postings);
     }
 
@@ -304,6 +320,9 @@ private:
 
     void append_byte(TermState& st, std::uint8_t byte) {
         if (st.last_chunk == kNoChunk || chunks[st.last_chunk].size == kChunkBytes) {
+            if (chunks.size() >= static_cast<std::size_t>(kNoChunk)) {
+                throw std::overflow_error("compact chunk index: exceeds uint32 sentinel range");
+            }
             const auto idx = static_cast<std::uint32_t>(chunks.size());
             chunks.emplace_back();
             if (st.first_chunk == kNoChunk) {
@@ -334,7 +353,7 @@ void add_posting(PartialIndex& idx, const std::string& term, int doc_id, int fre
 //   for each posting: <doc_id_delta:vbyte> <freq:vbyte>
 void spill_partial(const PartialIndex& idx, const fs::path& path) {
     std::vector<int> tids(idx.term_count());
-    for (std::size_t i = 0; i < tids.size(); ++i) tids[i] = static_cast<int>(i);
+    for (std::size_t i = 0; i < tids.size(); ++i) tids[i] = checked_int(i, "term id");
     std::sort(tids.begin(), tids.end(),
               [&](int a, int b) { return idx.term(a) < idx.term(b); });
 
@@ -348,13 +367,13 @@ void spill_partial(const PartialIndex& idx, const fs::path& path) {
         if (postings == 0) continue;
 
         buf.clear();
-        idx::varbyte::encode(static_cast<std::uint32_t>(term.size()), buf);
+        idx::varbyte::encode(checked_u32(term.size(), "spill term size"), buf);
         out.write(reinterpret_cast<const char*>(buf.data()),
                   static_cast<std::streamsize>(buf.size()));
         out.write(term.data(), static_cast<std::streamsize>(term.size()));
 
         buf.clear();
-        idx::varbyte::encode(static_cast<std::uint32_t>(postings), buf);
+        idx::varbyte::encode(checked_u32(postings, "spill posting count"), buf);
         out.write(reinterpret_cast<const char*>(buf.data()),
                   static_cast<std::streamsize>(buf.size()));
         idx.write_postings(tid, out);
@@ -397,6 +416,12 @@ bool read_spill_entry(std::ifstream& in, SpillEntry& entry, int file_index) {
         std::uint32_t delta = 0;
         std::uint32_t freq = 0;
         if (!read_varbyte(in, delta) || !read_varbyte(in, freq)) return false;
+        if (delta > static_cast<std::uint32_t>(std::numeric_limits<int>::max() - prev)) {
+            throw std::overflow_error("read_spill_entry: doc_id exceeds int range");
+        }
+        if (freq > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+            throw std::overflow_error("read_spill_entry: freq exceeds int range");
+        }
         prev += static_cast<int>(delta);
         entry.postings.emplace_back(prev, static_cast<int>(freq));
     }
@@ -440,6 +465,9 @@ public:
                 throw std::runtime_error("FinalWriter: postings must be sorted by doc_id");
             }
             if (did == pending_did_) {
+                if (freq > std::numeric_limits<int>::max() - pending_freq_) {
+                    throw std::overflow_error("FinalWriter: term frequency exceeds int range");
+                }
                 pending_freq_ += freq;
                 return;
             }
@@ -461,6 +489,12 @@ public:
         }
 
         const std::int64_t bytes_size = cur_offset_ - term_start_;
+        if (current_df_ > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            throw std::overflow_error("FinalWriter: df exceeds int range");
+        }
+        if (term_id_counter_ == std::numeric_limits<int>::max()) {
+            throw std::overflow_error("FinalWriter: term count exceeds int range");
+        }
         lex_out_ << current_term_ << ' ' << term_id_counter_ << ' ' << current_df_
                  << ' ' << term_start_ << ' ' << bytes_size << '\n';
         ++term_id_counter_;
@@ -538,10 +572,36 @@ void write_stats_json(const fs::path& path, const BuildStats& stats) {
         << "}\n";
 }
 
+class TempFileCleanup {
+public:
+    explicit TempFileCleanup(const std::vector<fs::path>& paths) : paths_(paths) {}
+    ~TempFileCleanup() { cleanup(); }
+
+    void cleanup() noexcept {
+        if (cleaned_) return;
+        for (const auto& p : paths_) {
+            std::error_code ec;
+            fs::remove(p, ec);
+        }
+        cleaned_ = true;
+    }
+
+private:
+    const std::vector<fs::path>& paths_;
+    bool cleaned_ = false;
+};
+
 }  // namespace
 
 void build_index(const fs::path& input_tsv, const fs::path& output_dir,
                  const BuildOptions& opts) {
+    if (opts.spill_threshold == 0) {
+        throw std::invalid_argument("build_index: spill_threshold must be positive");
+    }
+    if (opts.postings_per_block <= 0) {
+        throw std::invalid_argument("build_index: postings_per_block must be positive");
+    }
+
     fs::create_directories(output_dir);
     std::ifstream in(input_tsv, std::ios::binary);
     if (!in) throw std::runtime_error("build_index: cannot open " + input_tsv.string());
@@ -551,6 +611,7 @@ void build_index(const fs::path& input_tsv, const fs::path& output_dir,
 
     const std::string temp_prefix = (output_dir / "temp_index_").string();
     std::vector<fs::path> temp_files;
+    TempFileCleanup temp_cleanup(temp_files);
 
     PartialIndex partial;
     std::size_t partial_postings = 0;
@@ -571,6 +632,9 @@ void build_index(const fs::path& input_tsv, const fs::path& output_dir,
     tokens.reserve(128);
 
     while (std::getline(in, line)) {
+        if (doc_id_counter == std::numeric_limits<int>::max()) {
+            throw std::overflow_error("build_index: document count exceeds int range");
+        }
         const std::int64_t this_line_pos = line_pos;
         line_pos += static_cast<std::int64_t>(line.size()) + 1;  // assume LF separators
 
@@ -582,7 +646,7 @@ void build_index(const fs::path& input_tsv, const fs::path& output_dir,
 
         tokens.clear();
         idx::token::tokenize(text, tokens);
-        const int doc_length = static_cast<int>(tokens.size());
+        const int doc_length = checked_int(tokens.size(), "document length");
 
         // Per-document term-frequency aggregation, then push into partial index.
         std::unordered_map<std::string, int> per_doc;
@@ -599,8 +663,8 @@ void build_index(const fs::path& input_tsv, const fs::path& output_dir,
 
         if (partial_postings >= opts.spill_threshold) {
             const fs::path temp_path = temp_prefix + std::to_string(temp_files.size()) + ".bin";
-            spill_partial(partial, temp_path);
             temp_files.push_back(temp_path);
+            spill_partial(partial, temp_files.back());
             ++stats.spill_count;
             partial.clear();
             partial_postings = 0;
@@ -611,8 +675,8 @@ void build_index(const fs::path& input_tsv, const fs::path& output_dir,
 
     if (!partial.empty()) {
         const fs::path temp_path = temp_prefix + std::to_string(temp_files.size()) + ".bin";
-        spill_partial(partial, temp_path);
         temp_files.push_back(temp_path);
+        spill_partial(partial, temp_files.back());
         ++stats.spill_count;
         partial.clear();
     }
@@ -667,10 +731,6 @@ void build_index(const fs::path& input_tsv, const fs::path& output_dir,
         writer.finish_term();
     }
 
-    for (const auto& p : temp_files) {
-        std::error_code ec;
-        fs::remove(p, ec);
-    }
     stats.final_terms = static_cast<std::size_t>(writer.term_count());
     stats.final_index_bytes = static_cast<std::size_t>(writer.total_bytes());
     if (opts.stats) *opts.stats = stats;

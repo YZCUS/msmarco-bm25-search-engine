@@ -35,3 +35,32 @@ jobs:
 
       - name: Run tests
         run: ctest --test-dir build --output-on-failure
+
+  sanitizer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++-13
+
+      - name: Configure ASAN/UBSAN
+        env:
+          CXX: g++-13
+        run: |
+          cmake -B build-sanitizer \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DIDX_ASAN=ON \
+            -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build ASAN/UBSAN
+        run: cmake --build build-sanitizer -j
+
+      - name: Run ASAN/UBSAN tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-sanitizer --output-on-failure

@@ -4,6 +4,7 @@
 // the posting file across worker threads without holding a mutex on a single
 // ifstream.
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -29,6 +30,9 @@ public:
             const int err = errno;
             ::close(fd);
             throw std::system_error(err, std::generic_category(), "fstat: " + path);
+        }
+        if (st.st_size == 0) {
+            return MmapFile{fd, nullptr, 0};
         }
         void* p = ::mmap(nullptr, static_cast<std::size_t>(st.st_size),
                          PROT_READ, MAP_SHARED, fd, 0);

@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <random>
 #include <set>
 #include <sstream>
@@ -38,6 +39,10 @@ void write_tiny_collection(const fs::path& path) {
         << "2\tbar bar bar\n"
         << "3\tqux\n"
         << "4\tfoo bar\n";
+}
+
+void write_empty_collection(const fs::path& path) {
+    std::ofstream out(path);
 }
 
 idx::query::SearchEnginePaths paths_for(const fs::path& dir,
@@ -97,6 +102,21 @@ void test_build_then_search_roundtrip() {
     fs::remove_all(dir);
 }
 
+void test_empty_collection_builds_searchable_empty_index() {
+    auto dir = make_temp_dir();
+    const auto coll = dir / "collection.tsv";
+    write_empty_collection(coll);
+
+    idx::build::build_index(coll, dir);
+
+    idx::query::SearchEngine engine(paths_for(dir, coll));
+    IDX_CHECK_EQ(engine.total_docs(), 0);
+    IDX_CHECK_NEAR(engine.avg_doc_length(), 0.0, 1e-12);
+    IDX_CHECK(engine.search("foo", {.top_k = 10}).empty());
+
+    fs::remove_all(dir);
+}
+
 void test_passage_retrieval_when_collection_provided() {
     auto dir = make_temp_dir();
     const auto coll = dir / "collection.tsv";
@@ -108,6 +128,66 @@ void test_passage_retrieval_when_collection_provided() {
     IDX_CHECK_EQ(results.size(), 1u);
     IDX_CHECK_EQ(results.front().doc_id, 3);
     IDX_CHECK_EQ(results.front().passage, std::string{"qux"});
+
+    fs::remove_all(dir);
+}
+
+void test_invalid_build_options_throw() {
+    auto dir = make_temp_dir();
+    const auto coll = dir / "collection.tsv";
+    write_tiny_collection(coll);
+
+    {
+        idx::build::BuildOptions opts;
+        opts.spill_threshold = 0;
+        bool threw = false;
+        try {
+            idx::build::build_index(coll, dir / "zero_spill", opts);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        IDX_CHECK(threw);
+    }
+
+    {
+        idx::build::BuildOptions opts;
+        opts.postings_per_block = 0;
+        bool threw = false;
+        try {
+            idx::build::build_index(coll, dir / "zero_block", opts);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        IDX_CHECK(threw);
+    }
+
+    fs::remove_all(dir);
+}
+
+void test_temp_spills_are_cleaned_on_merge_failure() {
+    auto dir = make_temp_dir();
+    const auto coll = dir / "collection.tsv";
+    write_tiny_collection(coll);
+
+    fs::create_directory(dir / "final_sorted_index.bin");
+
+    idx::build::BuildOptions opts;
+    opts.spill_threshold = 1;
+    bool threw = false;
+    try {
+        idx::build::build_index(coll, dir, opts);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    IDX_CHECK(threw);
+
+    bool has_temp_spill = false;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (entry.path().filename().string().rfind("temp_index_", 0) == 0) {
+            has_temp_spill = true;
+        }
+    }
+    IDX_CHECK(!has_temp_spill);
 
     fs::remove_all(dir);
 }
@@ -147,7 +227,10 @@ void test_build_stats_reports_doc_term_postings() {
 
 int main() {
     test_build_then_search_roundtrip();
+    test_empty_collection_builds_searchable_empty_index();
     test_passage_retrieval_when_collection_provided();
+    test_invalid_build_options_throw();
+    test_temp_spills_are_cleaned_on_merge_failure();
     test_build_stats_reports_doc_term_postings();
     return idx::testing::report("test_builder");
 }

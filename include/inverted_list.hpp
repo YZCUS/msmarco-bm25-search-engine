@@ -13,7 +13,7 @@
 //   doc_id() / term_freq()
 //                       -> only valid after a successful advance/advanceTo
 //
-// On-disk format (per Appendix A of IMPLEMENTATION.md):
+// On-disk format:
 //
 //   [doc_id_section_block_0][freq_section_block_0]
 //   [doc_id_section_block_1][freq_section_block_1]

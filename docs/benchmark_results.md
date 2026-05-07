@@ -37,6 +37,22 @@ Measured with `bash bench/run_memory.sh data/collection.tsv` on the full
 Compact mode reduces peak RSS by `10.95%` and build time by `70.82%` versus
 the Vector baseline in the current streaming-merge implementation.
 
+## Memory-safety verification
+
+The builder/search regression suite now covers the edge cases found during the
+latest review:
+
+- Empty collections build a searchable empty index instead of failing on a
+  zero-byte posting mmap.
+- Invalid `BuildOptions` values fail fast before indexing starts.
+- Temporary spill files are removed if merge output fails.
+- The optional Arena builder mode releases term-dictionary memory before merge.
+- CI includes a Linux ASAN/UBSAN job in addition to Release VarByte/Raw32 tests.
+
+Local AppleClang ASAN was not used as the source of record because its runtime
+hangs during sanitizer initialization on this workstation; a UBSan-only local
+build passed the full CTest suite.
+
 ## Query latency (P6)
 
 | Threads | QPS | P50 | P95 | P99 |

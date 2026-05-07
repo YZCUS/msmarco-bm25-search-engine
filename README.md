@@ -7,7 +7,8 @@
 
 > Full benchmark tables and charts are in
 > [docs/benchmark_results.md](docs/benchmark_results.md). The test suite is
-> green under both `IDX_CODEC=VarByte` and `IDX_CODEC=Raw32`.
+> green under both `IDX_CODEC=VarByte` and `IDX_CODEC=Raw32`; CI also runs a
+> Linux ASAN/UBSAN sanitizer job.
 
 ## At a Glance
 
@@ -36,6 +37,14 @@ bash eval/prepare_msmarco.sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
+
+# Optional: local undefined-behavior sanitizer pass.
+cmake -B build-ubsan \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_CXX_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer -g" \
+    -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined"
+cmake --build build-ubsan -j
+ctest --test-dir build-ubsan --output-on-failure
 
 # 3. Build the inverted index.
 ./build/build_index data/collection.tsv data/index_varbyte/
@@ -110,6 +119,9 @@ scripts/    helper scripts (build_two_indexes, eval_all, plotters)
   a clean apples-to-apples compression number.
 - **Memory-bounded index construction** - compact VarByte spill buffers and a
   streaming final merge keep full-corpus build RSS under 165 MB.
+- **Regression-tested robustness** - empty indexes load cleanly, invalid builder
+  options fail fast, spill files are cleaned on failed merges, and Linux CI runs
+  ASAN/UBSAN.
 - **DAAT BM25 + block-skipping** - block-level metadata supports efficient
   conjunctive queries; MaxScore / WAND remain beyond the current scope.
 - **TREC eval pipeline** - produces the same run-file format used by Anserini /
